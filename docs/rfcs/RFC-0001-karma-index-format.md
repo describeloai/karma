@@ -184,7 +184,12 @@ bytes. See `interop/` (harness + golden Puffin fixtures).
    exact, engine-neutral, cross-read byte-identical. *Follow-up:* Parquet-exact
    decimal **bloom** hashing (today the bloom hashes the unscaled+scale bytes, which
    is self-consistent but not yet byte-compatible with Parquet's minimal
-   two's-complement big-endian decimal hashing — `bloom.rs::value_hash`).
+   two's-complement big-endian decimal hashing — `bloom.rs::value_hash`). This
+   follow-up is folded into the upstream alignment: the proposed `zone-map-v1`
+   standard (item 4) uses Iceberg Appendix-D single-value serialization for bounds
+   (decimal = minimum-width two's-complement big-endian, type from schema), which the
+   reference codec adopts as its pre-contribution delta — see
+   `docs/proposals/0001-puffin-secondary-indexes.md` §10.
 2. **Truncated bounds** — a canonical truncation rule so bounds stay small yet valid.
 3. **Zone identity** — *Partially resolved.* The `karma-parquet` reference read-path
    binds **`zone_id` = Parquet row-group ordinal** (and `row_offset` = the row group's
@@ -192,6 +197,10 @@ bytes. See `interop/` (harness + golden Puffin fixtures).
    not just RAM. `build_sidecar` derives the sidecar from a file's row groups. *Still
    open:* multi-file (manifest-level) zone maps, and independent chunking finer or
    coarser than a row group.
-4. **Upstreaming** — whether `karma-zonemap-v1` should be proposed as a standard
-   Iceberg/Puffin blob type. Being the co-designed standard is the strategic goal
-   (project thesis / HANDOFF §7, audit §9): own the format, whatever engine runs.
+4. **Upstreaming** — *In progress.* A proposal to add the zone-map and bloom blobs to
+   Apache Iceberg as standard Puffin blob types (`zone-map-v1`, `bloom-filter-v1`,
+   vendor-neutral names) is drafted in `docs/proposals/0001-puffin-secondary-indexes.md`
+   with PR-ready spec text in `0001-puffin-spec-delta.md`. It aligns the bound encoding
+   to Iceberg Appendix-D single-value serialization so the zone map is byte-compatible
+   with manifest bounds. Being the co-designed standard is the strategic goal (project
+   thesis / HANDOFF §7, audit §9): own the format, whatever engine runs.
