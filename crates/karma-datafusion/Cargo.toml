@@ -1,0 +1,15 @@
+[package]
+name = "karma-datafusion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "A DataFusion TableProvider that prunes scans using karma-index zone maps."
+
+[dependencies]
+datafusion = "54.0.0"
+karma-index = { path = "../karma-index" }
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
