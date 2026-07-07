@@ -1,0 +1,22 @@
+{
+  "_comment": "Canonical karma-bloom-v1 fixture. Rust and an independent Python SBBF+XXH64 impl each build a Puffin bloom blob from these values; the blob payload must be BYTE-IDENTICAL (proves XXH64 + split-block construction + layout are unambiguous). Values are strings (the primary high-cardinality case, XXH64-of-utf8 = Parquet-compatible).",
+  "bits_per_value": 16,
+  "fields": [3],
+  "entries": [
+    {
+      "zone_id": 0,
+      "field_id": 3,
+      "values": [
+        "u-00", "u-01", "u-02", "u-03", "u-04", "u-05", "u-06", "u-07", "u-08", "u-09",
+        "u-10", "u-11", "u-12", "u-13", "u-14", "u-15", "u-16", "u-17", "u-18", "u-19"
+      ]
+    },
+    {
+      "zone_id": 1,
+      "field_id": 3,
+      "values": ["v-00", "v-01", "v-02", "v-03", "v-04", "v-05", "v-06", "v-07", "v-08", "v-09"]
+    }
+  ],
+  "probes_present": ["u-05", "u-19", "v-00", "v-07"],
+  "probes_absent": ["u-99", "v-99", "zzz-absent", "nope"]
+}

@@ -8,9 +8,9 @@
 //! fresh checkout); CI / the full-spectrum run generates it first.
 
 use karma_index::{
-    read_puffin, ColumnStats, Value, ZoneMap, ZoneStats, ZONEMAP_BLOB_TYPE,
+    read_puffin, ColumnStats, Value, ZoneBlooms, ZoneMap, ZoneStats, BLOOM_BLOB_TYPE, ZONEMAP_BLOB_TYPE,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // MUST match interop/fixtures/zonemap.expected.json (independently — drift is
 // caught by the cross-read assertions on both sides).
@@ -51,4 +51,28 @@ fn rust_reads_python_written_puffin() {
     assert_eq!(meta.snapshot_id, -1);
     let zm = ZoneMap::decode(pf.blob_bytes(meta).unwrap()).expect("decode python-written zone map");
     assert_eq!(zm, canonical(), "Python-written zone map decoded by Rust must equal the canonical");
+}
+
+#[test]
+fn rust_reads_python_written_bloom() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../interop/fixtures");
+    let (py, rust) = (dir.join("bloom.python.puffin"), dir.join("bloom.rust.puffin"));
+    if !py.exists() || !rust.exists() {
+        eprintln!("skip: bloom fixtures not generated — run gen_fixture + interop_check.py");
+        return;
+    }
+    let decode = |p: &Path| -> ZoneBlooms {
+        let bytes = std::fs::read(p).unwrap();
+        let pf = read_puffin(&bytes).unwrap();
+        let m = pf.first_of_type(BLOOM_BLOB_TYPE).expect("karma-bloom-v1 blob present");
+        ZoneBlooms::decode(pf.blob_bytes(m).unwrap()).expect("decode bloom")
+    };
+    // Rust decodes the Python-written bloom, and it is structurally identical to
+    // the one Rust wrote (both built from the same fixture).
+    let (zb_py, zb_rust) = (decode(&py), decode(&rust));
+    assert_eq!(zb_py, zb_rust, "Python-written bloom must decode identically to Rust's");
+    // No false negatives on known-present values (an absent-value assertion would
+    // be flaky — a Bloom may report a false positive).
+    assert!(zb_py.might_contain(0, 3, &Value::str("u-05")));
+    assert!(zb_py.might_contain(1, 3, &Value::str("v-07")));
 }

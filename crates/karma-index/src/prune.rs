@@ -9,6 +9,7 @@
 
 use std::cmp::Ordering;
 
+use crate::bloom::ZoneBlooms;
 use crate::zonemap::{Value, ZoneMap, ZoneStats};
 
 /// A single-column comparison predicate over an Iceberg field ID.
@@ -80,6 +81,28 @@ pub fn surviving_zones(zm: &ZoneMap, pred: &Predicate) -> Vec<u32> {
     zm.zones
         .iter()
         .filter(|z| !can_skip(z, pred))
+        .map(|z| z.zone_id)
+        .collect()
+}
+
+/// Like [`surviving_zones`], but also consults a [`ZoneBlooms`] index: for an
+/// equality predicate, a zone is *additionally* skipped when its Bloom proves the
+/// value absent. Blooms only tighten pruning — a missing Bloom leaves the zone
+/// map's verdict untouched, and a Bloom never keeps a zone the zone map skipped.
+pub fn surviving_zones_indexed(zm: &ZoneMap, blooms: Option<&ZoneBlooms>, pred: &Predicate) -> Vec<u32> {
+    zm.zones
+        .iter()
+        .filter(|z| {
+            if can_skip(z, pred) {
+                return false;
+            }
+            if let (Predicate::Eq(field, v), Some(bl)) = (pred, blooms) {
+                if !bl.might_contain(z.zone_id, *field, v) {
+                    return false; // Bloom proves the value is absent from this zone
+                }
+            }
+            true
+        })
         .map(|z| z.zone_id)
         .collect()
 }

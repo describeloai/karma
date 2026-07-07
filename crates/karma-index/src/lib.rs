@@ -22,10 +22,12 @@
 //! Reserved for later blob types: `karma-bloom-v1`, `karma-bitmap-v1`,
 //! `karma-inverted-v1`.
 
+pub mod bloom;
 pub mod prune;
 pub mod puffin;
 pub mod zonemap;
 
-pub use prune::{surviving_zones, Predicate};
+pub use bloom::{value_hash, Bloom, BloomEntry, BloomError, ZoneBlooms, BLOOM_BLOB_TYPE, DEFAULT_BITS_PER_VALUE};
+pub use prune::{surviving_zones, surviving_zones_indexed, Predicate};
 pub use puffin::{read_puffin, write_puffin, BlobMetadata, BlobToWrite, PuffinError, PuffinFile};
 pub use zonemap::{ColumnStats, Value, ZoneMap, ZoneMapError, ZoneStats, ZONEMAP_BLOB_TYPE};

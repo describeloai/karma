@@ -10,3 +10,4 @@ description = "The open index format for Apache Iceberg, stored as Puffin blobs 
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+twox-hash.workspace = true
