@@ -149,6 +149,13 @@ it". The reference implementation encodes this by making the comparison return
 Tested: Puffin round-trip, zone-map round-trip (ints/floats/strings/nulls), and the
 full write→read→decode→prune loop; boundary and conservatism cases are asserted.
 
+**Cross-read validation.** A *second, independent* implementation (pure-stdlib
+Python, written from this spec — not ported from Rust) reads what Rust writes and
+vice-versa, and both encode the zone-map payload to **byte-identical** bytes. This is
+the format's robustness test — *"a second engine reads it"* — and an executable check
+that this RFC is unambiguous: two implementations from the text produced the same
+bytes. See `interop/` (harness + golden Puffin fixtures).
+
 ## 6. Open questions (for later RFCs / upstream discussion)
 
 1. **Decimal/temporal bound encoding** — exact, engine-neutral forms (e.g. Iceberg's
