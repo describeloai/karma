@@ -87,33 +87,94 @@ ZONEMAP_BLOB_TYPE = "karma-zonemap-v1"
 _VERSION = 1
 
 
-def _enc_value(v):
+# ── Iceberg Appendix-D single-value serialization ─────────────────────────────
+# Bounds carry no type tag; the type comes from the schema (field-id -> IcebergType),
+# exactly as Iceberg manifest lower/upper bounds do. A type is a string
+# ("boolean"|"int"|"long"|"float"|"double"|"date"|"time"|"timestamp"|"string"|
+# "binary") or the tuple ("decimal", scale).
+
+
+def _decimal_min_be(unscaled):
+    """Unscaled value as minimum-width, two's-complement, big-endian bytes
+    (Java BigInteger.toByteArray / Iceberg decimal single-value serialization)."""
+    length = (unscaled.bit_length() // 8) + 1
+    return unscaled.to_bytes(length, "big", signed=True)
+
+
+def _infer_type(col):
+    """Fallback type from a non-null bound (ints -> long, floats -> double, bytes ->
+    string), matching the Rust reference impl."""
+    for v in (col["min"], col["max"]):
+        kind = v[0]
+        if kind == "null":
+            continue
+        if kind == "i64":
+            return "long"
+        if kind == "f64":
+            return "double"
+        if kind == "bytes":
+            return "string"
+        if kind == "decimal":
+            return ("decimal", v[1][1])
+        return kind  # date/time/timestamp/bool
+    return "long"
+
+
+def _svs_bytes(v, ty):
+    """Single-value serialization of Value tuple `v` interpreted as `ty`. Null -> b""."""
     kind, val = v
     if kind == "null":
-        return b"\x00"
-    if kind == "bool":
-        return b"\x01" + (b"\x01" if val else b"\x00")
-    if kind == "i64":
-        return b"\x02" + struct.pack("<q", val)
-    if kind == "f64":
-        return b"\x03" + struct.pack("<d", val)
-    if kind == "bytes":
-        return b"\x04" + struct.pack("<I", len(val)) + val
-    if kind == "decimal":
-        unscaled, scale = val
-        return b"\x05" + unscaled.to_bytes(16, "little", signed=True) + struct.pack("<i", scale)
-    if kind == "date":
-        return b"\x06" + struct.pack("<i", val)
-    if kind == "time":
-        return b"\x07" + struct.pack("<q", val)
-    if kind == "timestamp":
-        return b"\x08" + struct.pack("<q", val)
-    raise ValueError("bad Value kind %r" % (kind,))
+        return b""
+    if ty == "boolean":
+        return b"\x01" if val else b"\x00"
+    if ty == "int":
+        return struct.pack("<i", val)
+    if ty == "long":
+        return struct.pack("<q", val)
+    if ty == "float":
+        return struct.pack("<f", val)
+    if ty == "double":
+        return struct.pack("<d", val)
+    if ty == "date":
+        return struct.pack("<i", val)
+    if ty in ("time", "timestamp"):
+        return struct.pack("<q", val)
+    if ty in ("string", "binary"):
+        return val
+    if isinstance(ty, tuple) and ty[0] == "decimal":
+        return _decimal_min_be(val[0])  # val = (unscaled, scale)
+    raise ValueError("bad Iceberg type %r" % (ty,))
 
 
-def encode_zonemap(zones):
+def _svs_to_value(b, ty):
+    """Inverse of `_svs_bytes` for a non-empty bound."""
+    if ty == "boolean":
+        return ("bool", b[0] != 0)
+    if ty == "int":
+        return ("i64", struct.unpack("<i", b)[0])
+    if ty == "long":
+        return ("i64", struct.unpack("<q", b)[0])
+    if ty == "float":
+        return ("f64", struct.unpack("<f", b)[0])
+    if ty == "double":
+        return ("f64", struct.unpack("<d", b)[0])
+    if ty == "date":
+        return ("date", struct.unpack("<i", b)[0])
+    if ty == "time":
+        return ("time", struct.unpack("<q", b)[0])
+    if ty == "timestamp":
+        return ("timestamp", struct.unpack("<q", b)[0])
+    if ty in ("string", "binary"):
+        return ("bytes", bytes(b))
+    if isinstance(ty, tuple) and ty[0] == "decimal":
+        return ("decimal", (int.from_bytes(b, "big", signed=True), ty[1]))
+    raise ValueError("bad Iceberg type %r" % (ty,))
+
+
+def encode_zonemap(zones, types):
     """zones: list of {zone_id, row_offset, row_count, columns:[{field_id, null_count,
-    value_count, min, max}]} where min/max are Value tuples. Returns payload bytes."""
+    value_count, min, max}]} with min/max as Value tuples. `types`: {field_id -> type}.
+    Returns payload bytes (bounds via Iceberg single-value serialization)."""
     out = bytearray()
     out += struct.pack("<B", _VERSION)
     out += struct.pack("<I", len(zones))
@@ -126,8 +187,11 @@ def encode_zonemap(zones):
             out += struct.pack("<i", c["field_id"])
             out += struct.pack("<Q", c["null_count"])
             out += struct.pack("<Q", c["value_count"])
-            out += _enc_value(c["min"])
-            out += _enc_value(c["max"])
+            ty = types.get(c["field_id"], _infer_type(c))
+            for bound in (c["min"], c["max"]):
+                b = _svs_bytes(bound, ty)
+                out += struct.pack("<I", len(b))
+                out += b
     return bytes(out)
 
 
@@ -155,33 +219,18 @@ class _Cur:
     def u64(self):
         return struct.unpack("<Q", self.take(8))[0]
 
-    def value(self):
-        tag = self.u8()
-        if tag == 0:
+    def bound(self, ty):
+        """Read one length-prefixed bound; 0 length is Null, else single-value bytes
+        interpreted with `ty` (required when present)."""
+        ln = self.u32()
+        if ln == 0:
             return ("null", None)
-        if tag == 1:
-            return ("bool", self.take(1)[0] != 0)
-        if tag == 2:
-            return ("i64", struct.unpack("<q", self.take(8))[0])
-        if tag == 3:
-            return ("f64", struct.unpack("<d", self.take(8))[0])
-        if tag == 4:
-            ln = self.u32()
-            return ("bytes", bytes(self.take(ln)))
-        if tag == 5:
-            unscaled = int.from_bytes(self.take(16), "little", signed=True)
-            scale = struct.unpack("<i", self.take(4))[0]
-            return ("decimal", (unscaled, scale))
-        if tag == 6:
-            return ("date", struct.unpack("<i", self.take(4))[0])
-        if tag == 7:
-            return ("time", struct.unpack("<q", self.take(8))[0])
-        if tag == 8:
-            return ("timestamp", struct.unpack("<q", self.take(8))[0])
-        raise ValueError("unknown Value tag %d" % tag)
+        if ty is None:
+            raise ValueError("no type in schema for a present bound")
+        return _svs_to_value(self.take(ln), ty)
 
 
-def decode_zonemap(payload):
+def decode_zonemap(payload, types):
     c = _Cur(payload)
     ver = c.u8()
     if ver != _VERSION:
@@ -196,8 +245,9 @@ def decode_zonemap(payload):
             fid = c.i32()
             nc = c.u64()
             vc = c.u64()
-            mn = c.value()
-            mx = c.value()
+            ty = types.get(fid)
+            mn = c.bound(ty)
+            mx = c.bound(ty)
             cols.append({"field_id": fid, "null_count": nc, "value_count": vc, "min": mn, "max": mx})
         zones.append({"zone_id": zid, "row_offset": ro, "row_count": rc, "columns": cols})
     return zones

@@ -9,8 +9,9 @@
 > This document is written to be handed to the Iceberg community. It is deliberately
 > aligned to Iceberg's *existing* conventions (Puffin container, `BlobMetadata`,
 > Appendix-D single-value serialization, the deletion-vector precedent) rather than
-> introducing a parallel design. Where our reference implementation currently differs
-> from what we propose as the standard, §10 says so plainly.
+> introducing a parallel design. The reference implementation emits exactly this
+> encoding — bounds are Iceberg single-value serialization, byte-identical across two
+> independent implementations (§8, §10).
 
 ---
 
@@ -210,24 +211,16 @@ index becomes part of Iceberg, read by whatever engine runs.
 Scope of this proposal is the two coarse-pruning blobs. Bitmap and inverted-index blobs,
 and multi-file (manifest-level) zone maps, are natural follow-ons (§13).
 
-## 10. Reference-impl deltas to align before contribution
+## 10. Reference implementation ↔ standard: aligned
 
-In the spirit of not hiding divergence, the reference codec's `v1` differs from the
-standard proposed here in exactly two mechanical ways, both about **bound encoding**:
-
-1. **Self-describing vs. schema-typed bounds.** The reference `v1` tags each bound with a
-   type byte and always widens integers to 8 bytes. The standard instead uses Iceberg
-   **Appendix-D single-value serialization** with the type taken from the field id — no
-   tag, `int` = 4 bytes, etc. — so bounds match manifest bounds exactly.
-2. **Decimal.** The reference `v1` stores a decimal as `i128` little-endian + an `i32`
-   scale. Iceberg (and this proposal) store the **unscaled value as minimum-width,
-   two's-complement big-endian**, with scale taken from the column type. The temporal and
-   string/boolean encodings already match Iceberg single-value serialization; only decimal
-   and the integer width/tagging change.
-
-These are small, mechanical edits to the codec and the cross-read fixtures, done as the
-pre-contribution step so the upstreamed `zone-map-v1` is byte-compatible with Iceberg
-manifest bounds from day one.
+The reference codec now emits **exactly** the encoding proposed here — bounds are Iceberg
+Appendix-D single-value serialization, length-prefixed, with the type resolved from the
+schema via field id (no per-value tag), and `decimal` serialized as minimum-width
+two's-complement big-endian. The two independent implementations (Rust + Python) produce
+byte-identical `zone-map-v1` payloads under this encoding, and the bloom hashes the same
+single-value bytes. So the reference impl and the proposed standard are the same bytes:
+there is no pre-contribution divergence left to reconcile. (Earlier drafts of this
+document flagged a self-describing tagged encoding as a delta; that has been applied.)
 
 ## 11. Adoption path
 

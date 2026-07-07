@@ -3,8 +3,8 @@
 //! "write an index, use it to skip work" loop that the format exists for.
 
 use karma_index::{
-    read_puffin, surviving_zones, write_puffin, BlobToWrite, ColumnStats, Predicate, Value, ZoneMap,
-    ZoneStats, ZONEMAP_BLOB_TYPE,
+    read_puffin, surviving_zones, write_puffin, BlobToWrite, ColumnStats, ColumnTypes, IcebergType, Predicate,
+    Value, ZoneMap, ZoneStats, ZONEMAP_BLOB_TYPE,
 };
 
 fn build_zone_map() -> ZoneMap {
@@ -39,6 +39,7 @@ fn build_zone_map() -> ZoneMap {
 #[test]
 fn write_read_prune_full_loop() {
     let zm = build_zone_map();
+    let types = ColumnTypes::from([(42, IcebergType::Long)]);
 
     // Store the zone map as a Puffin blob (as it would sit beside an Iceberg data file).
     let file = write_puffin(
@@ -47,7 +48,7 @@ fn write_read_prune_full_loop() {
             fields: vec![42],
             snapshot_id: -1,
             sequence_number: -1,
-            data: zm.encode(),
+            data: zm.encode(&types),
             properties: None,
         }],
         None,
@@ -57,7 +58,7 @@ fn write_read_prune_full_loop() {
     let pf = read_puffin(&file).unwrap();
     let meta = pf.first_of_type(ZONEMAP_BLOB_TYPE).expect("zone-map blob present");
     assert_eq!(meta.fields, vec![42]);
-    let decoded = ZoneMap::decode(pf.blob_bytes(meta).unwrap()).unwrap();
+    let decoded = ZoneMap::decode(pf.blob_bytes(meta).unwrap(), &types).unwrap();
     assert_eq!(decoded, zm);
 
     // Use it: `WHERE field42 > 4000` can only be in zone 1 — zone 0 is skipped.

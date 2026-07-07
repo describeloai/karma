@@ -47,6 +47,14 @@ def value_from_json(obj):
     raise ValueError("bad value tag %r" % (kind,))
 
 
+def types_from_json(schema):
+    """{"1": "long", ..., "10": {"decimal": 2}} -> {1: "long", ..., 10: ("decimal", 2)}."""
+    out = {}
+    for k, v in schema.items():
+        out[int(k)] = ("decimal", int(v["decimal"])) if isinstance(v, dict) and "decimal" in v else v
+    return out
+
+
 def load_canonical():
     exp = json.loads((FIX / "zonemap.expected.json").read_text(encoding="utf-8"))
     zones = []
@@ -62,12 +70,12 @@ def load_canonical():
             for c in z["columns"]
         ]
         zones.append({"zone_id": z["zone_id"], "row_offset": z["row_offset"], "row_count": z["row_count"], "columns": cols})
-    return exp["blob"], zones
+    return exp["blob"], zones, types_from_json(exp["schema"])
 
 
 def main():
-    blob, zones = load_canonical()
-    payload = ki.encode_zonemap(zones)
+    blob, zones, types = load_canonical()
+    payload = ki.encode_zonemap(zones, types)
 
     # Emit the Python-written fixture for the reverse (Python -> Rust) direction.
     py_file = ki.write_puffin(
@@ -97,7 +105,7 @@ def main():
     assert m["sequence-number"] == blob["sequence_number"], m["sequence-number"]
 
     rust_payload = ki.blob_bytes(data, m)
-    decoded = ki.decode_zonemap(rust_payload)
+    decoded = ki.decode_zonemap(rust_payload, types)
     assert decoded == zones, "decoded zone-map differs from canonical:\n  got %r\n  exp %r" % (decoded, zones)
 
     # The strong claim: two independent impls produce the SAME payload bytes.

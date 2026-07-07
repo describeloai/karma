@@ -8,9 +8,26 @@
 //! fresh checkout); CI / the full-spectrum run generates it first.
 
 use karma_index::{
-    read_puffin, ColumnStats, Value, ZoneBlooms, ZoneMap, ZoneStats, BLOOM_BLOB_TYPE, ZONEMAP_BLOB_TYPE,
+    read_puffin, ColumnStats, ColumnTypes, IcebergType, Value, ZoneBlooms, ZoneMap, ZoneStats, BLOOM_BLOB_TYPE,
+    ZONEMAP_BLOB_TYPE,
 };
 use std::path::{Path, PathBuf};
+
+// The schema (field id → type) an engine would have from table metadata. MUST match
+// the `schema` in zonemap.expected.json and gen_fixture's `canonical_types`.
+fn canonical_types() -> ColumnTypes {
+    ColumnTypes::from([
+        (1, IcebergType::Long),
+        (2, IcebergType::String),
+        (5, IcebergType::Double),
+        (6, IcebergType::Double),
+        (7, IcebergType::Boolean),
+        (10, IcebergType::Decimal { scale: 2 }),
+        (11, IcebergType::Date),
+        (12, IcebergType::Time),
+        (13, IcebergType::Timestamp),
+    ])
+}
 
 // MUST match interop/fixtures/zonemap.expected.json (independently — drift is
 // caught by the cross-read assertions on both sides).
@@ -60,7 +77,7 @@ fn rust_reads_python_written_puffin() {
     let meta = pf.first_of_type(ZONEMAP_BLOB_TYPE).expect("karma-zonemap-v1 blob present");
     assert_eq!(meta.fields, vec![1, 2, 5, 6, 7, 10, 11, 12, 13], "blob fields");
     assert_eq!(meta.snapshot_id, -1);
-    let zm = ZoneMap::decode(pf.blob_bytes(meta).unwrap()).expect("decode python-written zone map");
+    let zm = ZoneMap::decode(pf.blob_bytes(meta).unwrap(), &canonical_types()).expect("decode python-written zone map");
     assert_eq!(zm, canonical(), "Python-written zone map decoded by Rust must equal the canonical");
 }
 

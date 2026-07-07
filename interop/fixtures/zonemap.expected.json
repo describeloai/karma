@@ -1,10 +1,21 @@
 {
-  "_comment": "Canonical karma-zonemap-v1 fixture — the shared source of truth for cross-read validation. Rust and an INDEPENDENT Python impl each build a Puffin file from this and read the other's output; the zone-map payload bytes must be byte-identical. Values are tagged: one of i64|f64|str|bool|null|decimal|date|time|timestamp. decimal = {unscaled,scale} (exact, i128); date = days-since-epoch (i32); time = µs-since-midnight (i64); timestamp = µs-since-epoch (i64).",
+  "_comment": "Canonical karma-zonemap-v1 fixture — the shared source of truth for cross-read validation. Rust and an INDEPENDENT Python impl each build a Puffin file from this and read the other's output; the zone-map payload bytes must be byte-identical. Bounds carry NO type tag: each min/max is Iceberg Appendix-D single-value serialization, and its type comes from `schema` (field-id -> Iceberg type), exactly as manifest lower/upper bounds do. `min`/`max` here name a value as one of i64|f64|str|bool|null|decimal|date|time|timestamp for building the canonical, but the wire bytes are single-value serialization per the schema type (e.g. decimal = minimum-width two's-complement big-endian unscaled value).",
   "blob": {
     "type": "karma-zonemap-v1",
     "fields": [1, 2, 5, 6, 7, 10, 11, 12, 13],
     "snapshot_id": -1,
     "sequence_number": -1
+  },
+  "schema": {
+    "1": "long",
+    "2": "string",
+    "5": "double",
+    "6": "double",
+    "7": "boolean",
+    "10": { "decimal": 2 },
+    "11": "date",
+    "12": "time",
+    "13": "timestamp"
   },
   "zones": [
     {

@@ -35,25 +35,20 @@ pub enum BloomError {
 /// XXH64 (seed 0) of a value's canonical bytes; `None` for `Null` (never inserted
 /// or probed — a value predicate never matches NULL).
 ///
-/// The canonical bytes match the zone-map wire payload for each variant (minus the
-/// tag). NOTE: this is Bloom-*internal* — an equality probe only matches when it
-/// hashes the value identically, which it does. It is **not yet** Parquet-exact for
-/// `Decimal` (Parquet hashes the minimal two's-complement big-endian form); a
-/// future RFC pins a Parquet-compatible decimal hashing so our blooms interoperate
-/// with Parquet's own. Until then a decimal bloom is self-consistent, not shared.
+/// The hashed bytes are the value's **Iceberg single-value serialization** (the same
+/// bytes as its zone-map bound), so a bloom is engine-neutral and consistent with the
+/// bounds. For `decimal` this is the minimum-width two's-complement big-endian unscaled
+/// value (scale from the type, not hashed). String/binary/long/double/bool/temporal
+/// bytes are identical to Parquet's own bloom input.
 pub fn value_hash(v: &Value) -> Option<u64> {
     let bytes: Vec<u8> = match v {
-        Value::Bytes(b) => b.clone(),                      // Parquet-compatible for string/binary
-        Value::I64(x) => x.to_le_bytes().to_vec(),
-        Value::F64(x) => x.to_bits().to_le_bytes().to_vec(),
+        Value::Bytes(b) => b.clone(),                      // string/binary — raw bytes
+        Value::I64(x) => x.to_le_bytes().to_vec(),         // long — 8-byte LE
+        Value::F64(x) => x.to_bits().to_le_bytes().to_vec(), // double — 8-byte LE
         Value::Bool(b) => vec![*b as u8],
-        Value::Decimal { unscaled, scale } => {
-            let mut b = unscaled.to_le_bytes().to_vec(); // 16 bytes
-            b.extend_from_slice(&scale.to_le_bytes());
-            b
-        }
-        Value::Date(d) => d.to_le_bytes().to_vec(),
-        Value::Time(t) | Value::Timestamp(t) => t.to_le_bytes().to_vec(),
+        Value::Decimal { unscaled, .. } => crate::zonemap::decimal_min_be(*unscaled),
+        Value::Date(d) => d.to_le_bytes().to_vec(),        // 4-byte LE
+        Value::Time(t) | Value::Timestamp(t) => t.to_le_bytes().to_vec(), // 8-byte LE
         Value::Null => return None,
     };
     Some(twox_hash::XxHash64::oneshot(0, &bytes))

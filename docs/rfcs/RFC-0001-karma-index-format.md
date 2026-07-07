@@ -79,7 +79,7 @@ lower bound and `max` a true upper bound of the column within the zone.
 - `fields` = every Iceberg field ID present in the payload
 - `properties.zone-count` = decimal string, the number of zones (optional, advisory)
 
-### 3.3 Payload layout (little-endian)
+### 3.3 Payload layout (structural integers little-endian)
 
 ```
 u8   version            = 1
@@ -93,33 +93,34 @@ repeat zone_count:
     i32  field_id       Iceberg field ID
     u64  null_count
     u64  value_count    number of non-null values
-    Value min
-    Value max
-
-Value := u8 tag  +  payload
-  0  Null      → (no payload)          — an absent bound (e.g. an all-null zone)
-  1  Bool      → u8 (0|1)
-  2  I64       → i64
-  3  F64       → f64 (IEEE-754 bits)
-  4  Bytes     → u32 len + len bytes    — UTF-8 strings and opaque binary both ride here
-  5  Decimal   → i128 unscaled (16B) + i32 scale
-  6  Date      → i32                     — days since 1970-01-01 (Iceberg `date`)
-  7  Time      → i64                     — microseconds since midnight (Iceberg `time`)
-  8  Timestamp → i64                     — microseconds since epoch (`timestamp`/`timestamptz`)
+    u32  min_len ; min bytes   single-value serialization of the lower bound (len 0 = absent)
+    u32  max_len ; max bytes   single-value serialization of the upper bound
 ```
 
-**Type mapping.** Tags 0–4 cover Iceberg's primitive types by *ordering class*:
-integer-like → `I64`; float → `F64`; string/binary → `Bytes` (compared bytewise,
-which equals UTF-8 code-point order); boolean → `Bool`. Tags 5–8 carry the types
-that **must not** be collapsed: a decimal encoded as `F64` loses precision and would
-mis-prune (drop real rows), and a temporal needs a defined unit — so `Decimal` keeps
-the exact unscaled integer plus scale, and `Date`/`Time`/`Timestamp` fix engine-neutral
-units (days / µs / µs). Ordering within a column is exact: decimals compare by
-`unscaled` at a **common scale** (a scale mismatch is treated as incomparable — §4),
-temporals by their integer. The column's real Iceberg type lives in table metadata;
-the zone map only needs comparable bounds. Tags 0–4 are unchanged from v1, so the
-extension is backward-compatible; a reader that meets an unknown tag errors rather
-than guesses.
+**Bounds use Iceberg Appendix-D single-value serialization** — byte-for-byte the same
+encoding as manifest `lower_bounds`/`upper_bounds`. A bound carries **no type tag**; its
+type is resolved from the table schema via its field ID (the engine already has it,
+exactly as for manifest bounds). The reference codec threads a `field-id → IcebergType`
+map (`ColumnTypes`) into `encode`/`decode`. Per-type serialization:
+
+| Iceberg type | bytes |
+|---|---|
+| `boolean` | 1 byte (`0x00`/`0x01`) |
+| `int` / `long` | 4- / 8-byte little-endian two's complement |
+| `float` / `double` | 4- / 8-byte little-endian IEEE-754 |
+| `date` | `int` days since 1970-01-01 |
+| `time` | `long` microseconds since midnight |
+| `timestamp`/`timestamptz` | `long` microseconds since epoch |
+| `string` / `binary` / `fixed` | raw bytes (UTF-8 for string) |
+| `decimal(P,S)` | unscaled value as **minimum-width two's-complement big-endian** (scale from the type) |
+
+This makes the zone map a fine-grained refinement of Iceberg's own file-level bounds:
+engines reuse their existing comparators, and the bytes are identical to what a manifest
+already stores. A zero-length bound is an absent bound (an all-null zone). Ordering within
+a column is exact — in particular a `decimal` is compared by its unscaled value at a
+common scale (a scale mismatch is treated as incomparable, §4). This encoding is the
+alignment behind the upstream proposal (§6 item 4;
+`docs/proposals/0001-puffin-secondary-indexes.md`).
 
 ### 3.4 Reserved
 
@@ -179,17 +180,13 @@ bytes. See `interop/` (harness + golden Puffin fixtures).
 ## 6. Open questions (for later RFCs / upstream discussion)
 
 1. ~~**Decimal/temporal bound encoding** — exact, engine-neutral forms instead of
-   collapsing to `I64`/`F64`.~~ **Resolved** (this RFC, §3.3): tags 5–8 add
-   `Decimal{unscaled:i128, scale:i32}`, `Date(i32)`, `Time(i64)`, `Timestamp(i64)` —
-   exact, engine-neutral, cross-read byte-identical. *Follow-up:* Parquet-exact
-   decimal **bloom** hashing (today the bloom hashes the unscaled+scale bytes, which
-   is self-consistent but not yet byte-compatible with Parquet's minimal
-   two's-complement big-endian decimal hashing — `bloom.rs::value_hash`). This
-   follow-up is folded into the upstream alignment: the proposed `zone-map-v1`
-   standard (item 4) uses Iceberg Appendix-D single-value serialization for bounds
-   (decimal = minimum-width two's-complement big-endian, type from schema), which the
-   reference codec adopts as its pre-contribution delta — see
-   `docs/proposals/0001-puffin-secondary-indexes.md` §10.
+   collapsing to `I64`/`F64`.~~ **Resolved** (this RFC, §3.3): bounds are Iceberg
+   Appendix-D single-value serialization — `decimal` = minimum-width two's-complement
+   big-endian unscaled value (scale from schema), temporals as `int`/`long`, type from
+   the field's schema type. Exact, engine-neutral, byte-identical to manifest bounds,
+   and cross-read byte-identical between the two implementations. The bloom hashes the
+   *same* single-value bytes (`bloom.rs::value_hash`), so its decimal hashing is now
+   Parquet/Iceberg-consistent too. This encoding *is* the upstream alignment (item 4).
 2. **Truncated bounds** — a canonical truncation rule so bounds stay small yet valid.
 3. **Zone identity** — *Partially resolved.* The `karma-parquet` reference read-path
    binds **`zone_id` = Parquet row-group ordinal** (and `row_offset` = the row group's

@@ -10,10 +10,27 @@
 //! checks fail loudly if they ever drift, which is exactly the guarantee we want.
 
 use karma_index::{
-    write_puffin, BlobToWrite, Bloom, BloomEntry, ColumnStats, Value, ZoneBlooms, ZoneMap, ZoneStats,
-    BLOOM_BLOB_TYPE, ZONEMAP_BLOB_TYPE,
+    write_puffin, BlobToWrite, Bloom, BloomEntry, ColumnStats, ColumnTypes, IcebergType, Value, ZoneBlooms,
+    ZoneMap, ZoneStats, BLOOM_BLOB_TYPE, ZONEMAP_BLOB_TYPE,
 };
 use std::path::PathBuf;
+
+/// The schema (field id → Iceberg type) for the canonical fixture — the type
+/// information an engine would have from table metadata, used to serialize bounds.
+/// MUST match the `schema` section of `zonemap.expected.json`.
+fn canonical_types() -> ColumnTypes {
+    ColumnTypes::from([
+        (1, IcebergType::Long),
+        (2, IcebergType::String),
+        (5, IcebergType::Double),
+        (6, IcebergType::Double),
+        (7, IcebergType::Boolean),
+        (10, IcebergType::Decimal { scale: 2 }),
+        (11, IcebergType::Date),
+        (12, IcebergType::Time),
+        (13, IcebergType::Timestamp),
+    ])
+}
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../interop/fixtures")
@@ -64,7 +81,7 @@ fn main() {
             fields,
             snapshot_id: -1,
             sequence_number: -1,
-            data: zm.encode(),
+            data: zm.encode(&canonical_types()),
             properties: None,
         }],
         None,
