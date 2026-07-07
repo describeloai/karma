@@ -14,7 +14,8 @@ karma-index = { path = "../karma-index" }
 karma-datafusion = { path = "../karma-datafusion" }
 async-trait = "0.1"
 thiserror = { workspace = true }
-bytes = "1"
 
 [dev-dependencies]
+# `bytes` is only used by the instrumented ChunkReader in the read-path test.
+bytes = "1"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }

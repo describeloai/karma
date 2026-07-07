@@ -42,6 +42,7 @@ use datafusion::physical_plan::ExecutionPlan;
 
 use karma_index::{ZoneBlooms, ZoneMap};
 
+pub mod bench;
 pub mod build;
 pub mod read;
 

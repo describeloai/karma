@@ -15,7 +15,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use bytes::Bytes;
+use std::fs::File;
+
 use datafusion::arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
     Int64Array, LargeStringArray, StringArray, TimestampMicrosecondArray,
@@ -68,13 +69,14 @@ pub fn build_sidecar_sized(
     fields: &[IndexField],
     bits_per_value: usize,
 ) -> Result<Sidecar, KarmaParquetError> {
-    let data = std::fs::read(path)?;
-    let bytes = Bytes::from(data);
-
-    let head = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?;
+    // Read the footer for the schema + per-row-group metadata. We reopen the file
+    // once per row group below rather than slurping the whole file into memory, so a
+    // billion-row file's sidecar builds in bounded RAM (one row group at a time).
+    let head = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?;
     let schema = head.schema().clone();
     let meta = head.metadata().clone();
     let n_row_groups = meta.num_row_groups();
+    drop(head);
 
     // Resolve each indexed field to a (column index, data type) once.
     let mut resolved: Vec<(usize, DataType, &IndexField)> = Vec::with_capacity(fields.len());
@@ -93,7 +95,7 @@ pub fn build_sidecar_sized(
         let row_count = meta.row_group(rg).num_rows() as u64;
 
         // Read just this row group; a row group may arrive as several batches.
-        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?
+        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?
             .with_row_groups(vec![rg])
             .build()?;
 
