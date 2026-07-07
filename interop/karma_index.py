@@ -7,7 +7,10 @@ format is real and RFC-0001 is unambiguous. No third-party deps (no pyiceberg /
 pyarrow) — just `struct` + `json`.
 
 Value model (a Python tuple): ('null', None) | ('bool', bool) | ('i64', int) |
-('f64', float) | ('bytes', bytes). Strings ride as ('bytes', <utf-8>).
+('f64', float) | ('bytes', bytes) | ('decimal', (unscaled:int, scale:int)) |
+('date', int) | ('time', int) | ('timestamp', int). Strings ride as ('bytes',
+<utf-8>). Decimal keeps the exact unscaled i128 + scale (never an f64); date is
+days-since-epoch, time is µs-since-midnight, timestamp is µs-since-epoch.
 """
 
 import json
@@ -96,6 +99,15 @@ def _enc_value(v):
         return b"\x03" + struct.pack("<d", val)
     if kind == "bytes":
         return b"\x04" + struct.pack("<I", len(val)) + val
+    if kind == "decimal":
+        unscaled, scale = val
+        return b"\x05" + unscaled.to_bytes(16, "little", signed=True) + struct.pack("<i", scale)
+    if kind == "date":
+        return b"\x06" + struct.pack("<i", val)
+    if kind == "time":
+        return b"\x07" + struct.pack("<q", val)
+    if kind == "timestamp":
+        return b"\x08" + struct.pack("<q", val)
     raise ValueError("bad Value kind %r" % (kind,))
 
 
@@ -156,6 +168,16 @@ class _Cur:
         if tag == 4:
             ln = self.u32()
             return ("bytes", bytes(self.take(ln)))
+        if tag == 5:
+            unscaled = int.from_bytes(self.take(16), "little", signed=True)
+            scale = struct.unpack("<i", self.take(4))[0]
+            return ("decimal", (unscaled, scale))
+        if tag == 6:
+            return ("date", struct.unpack("<i", self.take(4))[0])
+        if tag == 7:
+            return ("time", struct.unpack("<q", self.take(8))[0])
+        if tag == 8:
+            return ("timestamp", struct.unpack("<q", self.take(8))[0])
         raise ValueError("unknown Value tag %d" % tag)
 
 

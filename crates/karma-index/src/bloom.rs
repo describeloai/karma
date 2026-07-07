@@ -34,12 +34,26 @@ pub enum BloomError {
 
 /// XXH64 (seed 0) of a value's canonical bytes; `None` for `Null` (never inserted
 /// or probed — a value predicate never matches NULL).
+///
+/// The canonical bytes match the zone-map wire payload for each variant (minus the
+/// tag). NOTE: this is Bloom-*internal* — an equality probe only matches when it
+/// hashes the value identically, which it does. It is **not yet** Parquet-exact for
+/// `Decimal` (Parquet hashes the minimal two's-complement big-endian form); a
+/// future RFC pins a Parquet-compatible decimal hashing so our blooms interoperate
+/// with Parquet's own. Until then a decimal bloom is self-consistent, not shared.
 pub fn value_hash(v: &Value) -> Option<u64> {
     let bytes: Vec<u8> = match v {
         Value::Bytes(b) => b.clone(),                      // Parquet-compatible for string/binary
         Value::I64(x) => x.to_le_bytes().to_vec(),
         Value::F64(x) => x.to_bits().to_le_bytes().to_vec(),
         Value::Bool(b) => vec![*b as u8],
+        Value::Decimal { unscaled, scale } => {
+            let mut b = unscaled.to_le_bytes().to_vec(); // 16 bytes
+            b.extend_from_slice(&scale.to_le_bytes());
+            b
+        }
+        Value::Date(d) => d.to_le_bytes().to_vec(),
+        Value::Time(t) | Value::Timestamp(t) => t.to_le_bytes().to_vec(),
         Value::Null => return None,
     };
     Some(twox_hash::XxHash64::oneshot(0, &bytes))

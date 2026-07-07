@@ -36,6 +36,14 @@ def value_from_json(obj):
         return ("bool", bool(val))
     if kind == "null":
         return ("null", None)
+    if kind == "decimal":  # {"decimal": {"unscaled": <int>, "scale": <int>}}
+        return ("decimal", (int(val["unscaled"]), int(val["scale"])))
+    if kind == "date":
+        return ("date", int(val))
+    if kind == "time":
+        return ("time", int(val))
+    if kind == "timestamp":
+        return ("timestamp", int(val))
     raise ValueError("bad value tag %r" % (kind,))
 
 

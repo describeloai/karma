@@ -97,19 +97,29 @@ repeat zone_count:
     Value max
 
 Value := u8 tag  +  payload
-  0  Null   → (no payload)          — an absent bound (e.g. an all-null zone)
-  1  Bool   → u8 (0|1)
-  2  I64    → i64
-  3  F64    → f64 (IEEE-754 bits)
-  4  Bytes  → u32 len + len bytes    — UTF-8 strings and opaque binary both ride here
+  0  Null      → (no payload)          — an absent bound (e.g. an all-null zone)
+  1  Bool      → u8 (0|1)
+  2  I64       → i64
+  3  F64       → f64 (IEEE-754 bits)
+  4  Bytes     → u32 len + len bytes    — UTF-8 strings and opaque binary both ride here
+  5  Decimal   → i128 unscaled (16B) + i32 scale
+  6  Date      → i32                     — days since 1970-01-01 (Iceberg `date`)
+  7  Time      → i64                     — microseconds since midnight (Iceberg `time`)
+  8  Timestamp → i64                     — microseconds since epoch (`timestamp`/`timestamptz`)
 ```
 
-**Type mapping.** The five wire forms cover Iceberg's primitive types by *ordering
-class*: integer-like → `I64`; floating/decimal → `F64`; string/binary → `Bytes`
-(compared bytewise, which equals UTF-8 code-point order); boolean → `Bool`. The
-column's real Iceberg type lives in table metadata; the zone map only needs
-comparable bounds. (Decimal/temporal bound encodings are refined in a follow-up;
-v1 readers treat unknown-but-typed bounds conservatively — see §4.)
+**Type mapping.** Tags 0–4 cover Iceberg's primitive types by *ordering class*:
+integer-like → `I64`; float → `F64`; string/binary → `Bytes` (compared bytewise,
+which equals UTF-8 code-point order); boolean → `Bool`. Tags 5–8 carry the types
+that **must not** be collapsed: a decimal encoded as `F64` loses precision and would
+mis-prune (drop real rows), and a temporal needs a defined unit — so `Decimal` keeps
+the exact unscaled integer plus scale, and `Date`/`Time`/`Timestamp` fix engine-neutral
+units (days / µs / µs). Ordering within a column is exact: decimals compare by
+`unscaled` at a **common scale** (a scale mismatch is treated as incomparable — §4),
+temporals by their integer. The column's real Iceberg type lives in table metadata;
+the zone map only needs comparable bounds. Tags 0–4 are unchanged from v1, so the
+extension is backward-compatible; a reader that meets an unknown tag errors rather
+than guesses.
 
 ### 3.4 Reserved
 
@@ -134,10 +144,11 @@ Additionally, a zone with `value_count = 0` (all nulls) is skipped for any value
 comparison (SQL three-valued logic: `col <op> v` is never TRUE when `col IS NULL`).
 
 **Conservatism is mandatory.** If the column has no stats in the zone, if the two
-values are of different `Value` variants, or if a float bound is `NaN`, the
-comparison is *undefined* and the zone **is not skipped**. Every "unsure" is "read
-it". The reference implementation encodes this by making the comparison return
-`None` and only skipping on a definite `Some(ordering)`.
+values are of different `Value` variants, if a float bound is `NaN`, or if two
+`Decimal` bounds carry different `scale`s, the comparison is *undefined* and the zone
+**is not skipped**. Every "unsure" is "read it". The reference implementation encodes
+this by making the comparison return `None` and only skipping on a definite
+`Some(ordering)`.
 
 ## 5. Reference implementation
 
@@ -146,8 +157,17 @@ it". The reference implementation encodes this by making the comparison return
 - `zonemap` — the `karma-zonemap-v1` codec (§3).
 - `prune` — the conservative pruning of §4 (`surviving_zones`, `can_skip`).
 
-Tested: Puffin round-trip, zone-map round-trip (ints/floats/strings/nulls), and the
-full write→read→decode→prune loop; boundary and conservatism cases are asserted.
+`crates/karma-parquet` is the **read-path**: a Parquet-backed `TableProvider` where a
+zone is a row group and the sidecar (zone map + blooms) is built from the file by
+`build_sidecar`; a scan reads only the surviving row groups (proven by an instrumented
+reader — the pruned row group's bytes are never fetched). The `Expr → Predicate`
+translation is shared with `crates/karma-datafusion` (`translate`) so the two providers
+can't drift.
+
+Tested: Puffin round-trip, zone-map round-trip (ints/floats/strings/nulls/decimals/
+dates/times/timestamps), the full write→read→decode→prune loop, exact decimal/temporal
+pruning (incl. scale-mismatch conservatism), and the Parquet read-path (I/O-skip,
+full-scan differential, bloom-beats-stats); boundary and conservatism cases are asserted.
 
 **Cross-read validation.** A *second, independent* implementation (pure-stdlib
 Python, written from this spec — not ported from Rust) reads what Rust writes and
@@ -158,11 +178,20 @@ bytes. See `interop/` (harness + golden Puffin fixtures).
 
 ## 6. Open questions (for later RFCs / upstream discussion)
 
-1. **Decimal/temporal bound encoding** — exact, engine-neutral forms (e.g. Iceberg's
-   single-value serialization) instead of collapsing to `I64`/`F64`.
+1. ~~**Decimal/temporal bound encoding** — exact, engine-neutral forms instead of
+   collapsing to `I64`/`F64`.~~ **Resolved** (this RFC, §3.3): tags 5–8 add
+   `Decimal{unscaled:i128, scale:i32}`, `Date(i32)`, `Time(i64)`, `Timestamp(i64)` —
+   exact, engine-neutral, cross-read byte-identical. *Follow-up:* Parquet-exact
+   decimal **bloom** hashing (today the bloom hashes the unscaled+scale bytes, which
+   is self-consistent but not yet byte-compatible with Parquet's minimal
+   two's-complement big-endian decimal hashing — `bloom.rs::value_hash`).
 2. **Truncated bounds** — a canonical truncation rule so bounds stay small yet valid.
-3. **Zone identity** — binding `zone_id`/`row_offset` to Parquet row-group indices vs.
-   an independent chunking, and multi-file (manifest-level) zone maps.
+3. **Zone identity** — *Partially resolved.* The `karma-parquet` reference read-path
+   binds **`zone_id` = Parquet row-group ordinal** (and `row_offset` = the row group's
+   first row), so a query reads only the surviving row groups — the index skips I/O,
+   not just RAM. `build_sidecar` derives the sidecar from a file's row groups. *Still
+   open:* multi-file (manifest-level) zone maps, and independent chunking finer or
+   coarser than a row group.
 4. **Upstreaming** — whether `karma-zonemap-v1` should be proposed as a standard
    Iceberg/Puffin blob type. Being the co-designed standard is the strategic goal
    (project thesis / HANDOFF §7, audit §9): own the format, whatever engine runs.

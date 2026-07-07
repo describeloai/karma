@@ -1,0 +1,20 @@
+[package]
+name = "karma-parquet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "A Parquet-backed karma-index TableProvider — skips row-group I/O using a Puffin sidecar (zone map + bloom)."
+
+[dependencies]
+# datafusion re-exports the version-matched `arrow` and `parquet` (incl. the C
+# `zstd-sys`), so we pull neither directly — avoids an arrow/parquet version skew.
+datafusion = "54.0.0"
+karma-index = { path = "../karma-index" }
+karma-datafusion = { path = "../karma-datafusion" }
+async-trait = "0.1"
+thiserror = { workspace = true }
+bytes = "1"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }

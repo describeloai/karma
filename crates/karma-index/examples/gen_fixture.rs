@@ -39,8 +39,21 @@ fn canonical() -> (ZoneMap, Vec<i32>) {
             row_count: 50,
             columns: vec![ColumnStats { field_id: 1, min: Value::I64(20), max: Value::I64(30), null_count: 0, value_count: 50 }],
         },
+        // Zone 2 exercises the exact decimal/temporal bounds (tags 5-8), including a
+        // negative decimal unscaled (i128 sign) and a negative date (i32 sign).
+        ZoneStats {
+            zone_id: 2,
+            row_offset: 150,
+            row_count: 25,
+            columns: vec![
+                ColumnStats { field_id: 10, min: Value::Decimal { unscaled: -10050, scale: 2 }, max: Value::Decimal { unscaled: 999_999, scale: 2 }, null_count: 0, value_count: 25 },
+                ColumnStats { field_id: 11, min: Value::Date(-1), max: Value::Date(19_723), null_count: 0, value_count: 25 },
+                ColumnStats { field_id: 12, min: Value::Time(0), max: Value::Time(86_399_999_999), null_count: 0, value_count: 25 },
+                ColumnStats { field_id: 13, min: Value::Timestamp(1_672_531_200_000_000), max: Value::Timestamp(1_704_067_200_000_000), null_count: 0, value_count: 25 },
+            ],
+        },
     ]);
-    (zm, vec![1, 2, 5, 6, 7])
+    (zm, vec![1, 2, 5, 6, 7, 10, 11, 12, 13])
 }
 
 fn main() {

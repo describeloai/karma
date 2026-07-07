@@ -22,16 +22,23 @@
 //!       Value min
 //!       Value max
 //!   Value := u8 tag  +  payload
-//!            0 Null   → (no payload)
-//!            1 Bool   → u8 (0|1)
-//!            2 I64    → i64
-//!            3 F64    → f64 (IEEE-754 bits)
-//!            4 Bytes  → u32 len + len bytes   (utf8 strings & opaque both ride here)
+//!            0 Null      → (no payload)
+//!            1 Bool      → u8 (0|1)
+//!            2 I64       → i64
+//!            3 F64       → f64 (IEEE-754 bits)
+//!            4 Bytes     → u32 len + len bytes   (utf8 strings & opaque both ride here)
+//!            5 Decimal   → i128 unscaled (16B LE) + i32 scale (LE)
+//!            6 Date      → i32 days since 1970-01-01 (LE)
+//!            7 Time      → i64 microseconds since midnight (LE)
+//!            8 Timestamp → i64 microseconds since epoch (LE)
 //! ```
-//! Types collapse to five wire forms on purpose: integer-like → `I64`, float/decimal
-//! → `F64`, string/binary → `Bytes`, boolean → `Bool`, and an all-null bound → `Null`.
-//! The Iceberg column's real type lives in table metadata; the zone map only needs
-//! ordered bounds.
+//! Tags 0-4 collapse the common types to ordered wire forms: integer-like → `I64`,
+//! float → `F64`, string/binary → `Bytes`, boolean → `Bool`, all-null bound → `Null`.
+//! Tags 5-8 carry the types that *cannot* be collapsed without losing pruning
+//! correctness: a decimal compared as `F64` loses precision (wrong pruning → dropped
+//! rows), and a temporal needs a defined unit. They are engine-neutral (Iceberg
+//! `decimal`/`date`/`time`/`timestamp` single-value forms). The Iceberg column's real
+//! type lives in table metadata; the zone map only needs ordered bounds.
 
 pub const ZONEMAP_BLOB_TYPE: &str = "karma-zonemap-v1";
 const VERSION: u8 = 1;
@@ -55,6 +62,16 @@ pub enum Value {
     I64(i64),
     F64(f64),
     Bytes(Vec<u8>),
+    /// An exact decimal bound. Within a column the scale is fixed, so ordering
+    /// reduces to comparing `unscaled` (see [`crate::prune`]); a decimal must NOT
+    /// ride as `F64`, which would lose precision and mis-prune.
+    Decimal { unscaled: i128, scale: i32 },
+    /// Iceberg `date` — days since 1970-01-01.
+    Date(i32),
+    /// Iceberg `time` — microseconds since midnight.
+    Time(i64),
+    /// Iceberg `timestamp`/`timestamptz` — microseconds since the Unix epoch.
+    Timestamp(i64),
 }
 
 impl Value {
@@ -179,6 +196,23 @@ fn put_value(o: &mut Vec<u8>, v: &Value) {
             put_u32(o, bs.len() as u32);
             o.extend_from_slice(bs);
         }
+        Value::Decimal { unscaled, scale } => {
+            o.push(5);
+            o.extend_from_slice(&unscaled.to_le_bytes());
+            o.extend_from_slice(&scale.to_le_bytes());
+        }
+        Value::Date(d) => {
+            o.push(6);
+            o.extend_from_slice(&d.to_le_bytes());
+        }
+        Value::Time(t) => {
+            o.push(7);
+            o.extend_from_slice(&t.to_le_bytes());
+        }
+        Value::Timestamp(t) => {
+            o.push(8);
+            o.extend_from_slice(&t.to_le_bytes());
+        }
     }
 }
 
@@ -206,17 +240,27 @@ impl<'a> Cur<'a> {
     fn u64(&mut self) -> Result<u64, ZoneMapError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
+    fn i64(&mut self) -> Result<i64, ZoneMapError> {
+        Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn i128(&mut self) -> Result<i128, ZoneMapError> {
+        Ok(i128::from_le_bytes(self.take(16)?.try_into().unwrap()))
+    }
     fn value(&mut self) -> Result<Value, ZoneMapError> {
         let tag = self.u8()?;
         Ok(match tag {
             0 => Value::Null,
             1 => Value::Bool(self.u8()? != 0),
-            2 => Value::I64(i64::from_le_bytes(self.take(8)?.try_into().unwrap())),
-            3 => Value::F64(f64::from_bits(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))),
+            2 => Value::I64(self.i64()?),
+            3 => Value::F64(f64::from_bits(self.u64()?)),
             4 => {
                 let len = self.u32()? as usize;
                 Value::Bytes(self.take(len)?.to_vec())
             }
+            5 => Value::Decimal { unscaled: self.i128()?, scale: self.i32()? },
+            6 => Value::Date(self.i32()?),
+            7 => Value::Time(self.i64()?),
+            8 => Value::Timestamp(self.i64()?),
             other => return Err(ZoneMapError::BadValueTag(other)),
         })
     }
@@ -268,6 +312,25 @@ mod tests {
             columns: vec![
                 ColumnStats { field_id: 5, min: Value::F64(-1.5), max: Value::F64(3.25), null_count: 0, value_count: 1 },
                 ColumnStats { field_id: 6, min: Value::Null, max: Value::Null, null_count: 1, value_count: 0 },
+            ],
+        }]);
+        assert_eq!(zm, ZoneMap::decode(&zm.encode()).unwrap());
+    }
+
+    #[test]
+    fn decimal_and_temporal_roundtrip() {
+        let zm = ZoneMap::new(vec![ZoneStats {
+            zone_id: 3,
+            row_offset: 0,
+            row_count: 4,
+            columns: vec![
+                // Decimal(10,2): 100.50 .. 9999.99 → unscaled 10050 .. 999999, scale 2.
+                ColumnStats { field_id: 10, min: Value::Decimal { unscaled: 10050, scale: 2 }, max: Value::Decimal { unscaled: 999_999, scale: 2 }, null_count: 0, value_count: 4 },
+                // A negative / large-magnitude decimal exercises the i128 sign path.
+                ColumnStats { field_id: 11, min: Value::Decimal { unscaled: -170_141_183_460_469_231_731i128, scale: 9 }, max: Value::Decimal { unscaled: i128::MAX, scale: 9 }, null_count: 0, value_count: 4 },
+                ColumnStats { field_id: 12, min: Value::Date(-1), max: Value::Date(19_723), null_count: 0, value_count: 4 },
+                ColumnStats { field_id: 13, min: Value::Time(0), max: Value::Time(86_399_999_999), null_count: 0, value_count: 4 },
+                ColumnStats { field_id: 14, min: Value::Timestamp(i64::MIN), max: Value::Timestamp(1_704_067_200_000_000), null_count: 0, value_count: 4 },
             ],
         }]);
         assert_eq!(zm, ZoneMap::decode(&zm.encode()).unwrap());

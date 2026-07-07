@@ -19,20 +19,21 @@
 //! in `karma-index`.) The tests assert this by diffing against an unindexed
 //! `MemTable` over the same data.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{Column, ScalarValue};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown, TableType};
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 
-use karma_index::{surviving_zones_indexed, Predicate, Value, ZoneBlooms, ZoneMap};
+use karma_index::{ZoneBlooms, ZoneMap};
+
+pub mod translate;
 
 /// A DataFusion table whose scan is pruned by a karma-index zone map.
 ///
@@ -68,114 +69,12 @@ impl KarmaZoneTable {
         self
     }
 
-    /// The indices of the zones that survive the filters (must be scanned). This
-    /// is the pruning payoff — pure and independently testable. Zones surviving
-    /// *every* translatable predicate (AND semantics); untranslatable filters are
-    /// ignored here (DataFusion re-applies them on the rows).
+    /// The indices of the zones that survive the filters (must be scanned) — the
+    /// pruning payoff, pure and independently testable. Delegates to the shared
+    /// [`translate`] module so this and the Parquet provider never drift.
     pub fn surviving_zone_indices(&self, filters: &[Expr]) -> Vec<usize> {
-        let mut preds = Vec::new();
-        let mut inlists: Vec<(i32, Vec<Value>)> = Vec::new();
-        for f in filters {
-            self.collect(f, &mut preds, &mut inlists);
-        }
-        let zone_id = |i: usize| self.zone_map.zones[i].zone_id;
-        let mut alive: Vec<usize> = (0..self.zone_map.zones.len()).collect();
-
-        // Comparison predicates are ANDed: a zone must survive every one.
-        for p in &preds {
-            let surviving: HashSet<u32> =
-                surviving_zones_indexed(&self.zone_map, self.blooms.as_ref(), p).into_iter().collect();
-            alive.retain(|&i| surviving.contains(&zone_id(i)));
-        }
-        // `col IN (v₁ … vₙ)`: a zone survives if it survives `= vⱼ` for SOME j (OR).
-        for (field, vals) in &inlists {
-            let mut surviving: HashSet<u32> = HashSet::new();
-            for v in vals {
-                let pred = Predicate::Eq(*field, v.clone());
-                surviving.extend(surviving_zones_indexed(&self.zone_map, self.blooms.as_ref(), &pred));
-            }
-            alive.retain(|&i| surviving.contains(&zone_id(i)));
-        }
-        alive
+        translate::surviving_zone_indices(&self.zone_map, self.blooms.as_ref(), &self.field_ids, filters)
     }
-
-    /// Flatten a filter into prunable constraints: comparison predicates (splitting
-    /// top-level `AND`s, translating `col <op> literal` / `literal <op> col`), and
-    /// `col IN (literal…)` lists. Anything else is left for DataFusion's re-check.
-    fn collect(&self, expr: &Expr, preds: &mut Vec<Predicate>, inlists: &mut Vec<(i32, Vec<Value>)>) {
-        match expr {
-            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-                if *op == Operator::And {
-                    self.collect(left, preds, inlists);
-                    self.collect(right, preds, inlists);
-                    return;
-                }
-                // Normalize to `column <op> value`, flipping if the literal is on
-                // the left (`5 < x` ≡ `x > 5`).
-                let (col, op, scalar): (&Column, Operator, &ScalarValue) = match (left.as_ref(), right.as_ref()) {
-                    (Expr::Column(c), Expr::Literal(s, _)) => (c, *op, s),
-                    (Expr::Literal(s, _), Expr::Column(c)) => (c, flip_op(*op), s),
-                    _ => return,
-                };
-                if let (Some(&fid), Some(value)) = (self.field_ids.get(col.name.as_str()), scalar_to_value(scalar)) {
-                    if let Some(p) = make_predicate(fid, op, value) {
-                        preds.push(p);
-                    }
-                }
-            }
-            Expr::InList(il) if !il.negated => {
-                if let Expr::Column(c) = il.expr.as_ref() {
-                    if let Some(&fid) = self.field_ids.get(c.name.as_str()) {
-                        let vals: Vec<Value> = il
-                            .list
-                            .iter()
-                            .filter_map(|e| match e {
-                                Expr::Literal(s, _) => scalar_to_value(s),
-                                _ => None,
-                            })
-                            .collect();
-                        if !vals.is_empty() && vals.len() == il.list.len() {
-                            inlists.push((fid, vals));
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn flip_op(op: Operator) -> Operator {
-    match op {
-        Operator::Lt => Operator::Gt,
-        Operator::LtEq => Operator::GtEq,
-        Operator::Gt => Operator::Lt,
-        Operator::GtEq => Operator::LtEq,
-        other => other,
-    }
-}
-
-fn make_predicate(field_id: i32, op: Operator, v: Value) -> Option<Predicate> {
-    Some(match op {
-        Operator::Eq => Predicate::Eq(field_id, v),
-        Operator::Lt => Predicate::Lt(field_id, v),
-        Operator::LtEq => Predicate::LtEq(field_id, v),
-        Operator::Gt => Predicate::Gt(field_id, v),
-        Operator::GtEq => Predicate::GtEq(field_id, v),
-        _ => return None, // NotEq / others: a zone map can't prune these
-    })
-}
-
-fn scalar_to_value(s: &ScalarValue) -> Option<Value> {
-    Some(match s {
-        ScalarValue::Int64(Some(v)) => Value::I64(*v),
-        ScalarValue::Int32(Some(v)) => Value::I64(*v as i64),
-        ScalarValue::Float64(Some(v)) => Value::F64(*v),
-        ScalarValue::Float32(Some(v)) => Value::F64(*v as f64),
-        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => Value::Bytes(v.clone().into_bytes()),
-        ScalarValue::Boolean(Some(v)) => Value::Bool(*v),
-        _ => return None,
-    })
 }
 
 #[async_trait]
@@ -189,20 +88,7 @@ impl TableProvider for KarmaZoneTable {
     }
 
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        // Inexact where we can extract at least one prunable predicate (we prune,
-        // DataFusion re-checks rows); Unsupported otherwise.
-        Ok(filters
-            .iter()
-            .map(|f| {
-                let (mut preds, mut inlists) = (Vec::new(), Vec::new());
-                self.collect(f, &mut preds, &mut inlists);
-                if preds.is_empty() && inlists.is_empty() {
-                    TableProviderFilterPushDown::Unsupported
-                } else {
-                    TableProviderFilterPushDown::Inexact
-                }
-            })
-            .collect())
+        Ok(translate::filters_pushdown(&self.field_ids, filters))
     }
 
     async fn scan(
@@ -225,9 +111,10 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::{Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::ScalarValue;
     use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionContext;
-    use karma_index::{Bloom, BloomEntry, ColumnStats, ZoneBlooms, ZoneStats, DEFAULT_BITS_PER_VALUE};
+    use karma_index::{Bloom, BloomEntry, ColumnStats, Value, ZoneBlooms, ZoneStats, DEFAULT_BITS_PER_VALUE};
 
     // Two zones. id: zone0 ∈ [0,4], zone1 ∈ [20,24]. name mirrors id as strings.
     // field ids: id=1, name=2.
@@ -407,6 +294,97 @@ mod tests {
         // With the Bloom, zone 0 (which lacks 'k-03') is pruned.
         let t = KarmaZoneTable::new(schema, zm, batches, fids).with_blooms(zb);
         assert_eq!(t.surviving_zone_indices(&[eq]), vec![1]);
+    }
+
+    // ── decimal + temporal exact bounds (Deliverable B) ──
+    // amount Decimal(10,2) field 1, ts Timestamp(µs) field 2. Overlap-free zones:
+    // zone 0 = 1.00..50.00 in 2023; zone 1 = 100.50..999.99 in 2024.
+    fn decimal_temporal_fixture() -> (SchemaRef, ZoneMap, Vec<RecordBatch>, HashMap<String, i32>) {
+        use datafusion::arrow::array::{Decimal128Array, TimestampMicrosecondArray};
+        use datafusion::arrow::datatypes::TimeUnit;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("amount", DataType::Decimal128(10, 2), false),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+        ]));
+        let ts_2023: i64 = 1_672_531_200_000_000; // 2023-01-01T00:00:00Z
+        let ts_2024: i64 = 1_704_067_200_000_000; // 2024-01-01T00:00:00Z
+        let batch = |amts: Vec<i128>, tss: Vec<i64>| {
+            let a = Decimal128Array::from(amts).with_precision_and_scale(10, 2).unwrap();
+            let t = TimestampMicrosecondArray::from(tss);
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(a), Arc::new(t)]).unwrap()
+        };
+        let b0 = batch(vec![100, 2500, 5000], vec![ts_2023, ts_2023 + 1_000_000, ts_2024 - 1]);
+        let b1 = batch(vec![10050, 50000, 99999], vec![ts_2024, ts_2024 + 1_000_000, ts_2024 + 2_000_000]);
+
+        let dec = |u: i128| Value::Decimal { unscaled: u, scale: 2 };
+        let col = |fid, mn, mx| ColumnStats { field_id: fid, min: mn, max: mx, null_count: 0, value_count: 3 };
+        let zm = ZoneMap::new(vec![
+            ZoneStats { zone_id: 0, row_offset: 0, row_count: 3, columns: vec![
+                col(1, dec(100), dec(5000)),
+                col(2, Value::Timestamp(ts_2023), Value::Timestamp(ts_2024 - 1)),
+            ]},
+            ZoneStats { zone_id: 1, row_offset: 3, row_count: 3, columns: vec![
+                col(1, dec(10050), dec(99999)),
+                col(2, Value::Timestamp(ts_2024), Value::Timestamp(ts_2024 + 2_000_000)),
+            ]},
+        ]);
+        let field_ids = HashMap::from([("amount".to_string(), 1), ("ts".to_string(), 2)]);
+        (schema, zm, vec![b0, b1], field_ids)
+    }
+
+    // The pruning payoff for exact decimal/temporal bounds (constructed Exprs so the
+    // literal reaches the provider at the column's native scale/unit, not SQL-coerced).
+    #[test]
+    fn decimal_and_temporal_prune() {
+        let (schema, zm, batches, fids) = decimal_temporal_fixture();
+        let t = KarmaZoneTable::new(schema, zm, batches, fids);
+
+        // amount > 100.50 (unscaled 10050, scale 2) → zone 0 (max 50.00) pruned.
+        let gt = datafusion::prelude::col("amount")
+            .gt(Expr::Literal(ScalarValue::Decimal128(Some(10050), 10, 2), None));
+        assert_eq!(t.surviving_zone_indices(&[gt]), vec![1], "amount>100.50 prunes zone 0");
+
+        // amount = 25.00 (unscaled 2500) → only zone 0.
+        let eq = datafusion::prelude::col("amount")
+            .eq(Expr::Literal(ScalarValue::Decimal128(Some(2500), 10, 2), None));
+        assert_eq!(t.surviving_zone_indices(&[eq]), vec![0], "amount=25.00 prunes zone 1");
+
+        // ts >= 2024-01-01 → zone 0 pruned.
+        let ts_2024: i64 = 1_704_067_200_000_000;
+        let ge = datafusion::prelude::col("ts")
+            .gt_eq(Expr::Literal(ScalarValue::TimestampMicrosecond(Some(ts_2024), None), None));
+        assert_eq!(t.surviving_zone_indices(&[ge]), vec![1], "ts>='2024-01-01' prunes zone 0");
+
+        // A millisecond literal normalizes to micros before comparison.
+        let ge_ms = datafusion::prelude::col("ts")
+            .gt_eq(Expr::Literal(ScalarValue::TimestampMillisecond(Some(ts_2024 / 1_000), None), None));
+        assert_eq!(t.surviving_zone_indices(&[ge_ms]), vec![1], "ms literal normalizes to µs");
+    }
+
+    // Correctness: the pruned scan returns exactly the full-scan rows, for decimal
+    // and timestamp predicates driven through real SQL (including string→timestamp
+    // and decimal-literal coercion, where pruning may fall back to conservative).
+    #[tokio::test]
+    async fn decimal_temporal_results_match_memtable() {
+        let (schema, zm, batches, fids) = decimal_temporal_fixture();
+        let kctx = SessionContext::new();
+        kctx.register_table("t", Arc::new(KarmaZoneTable::new(schema.clone(), zm, batches.clone(), fids))).unwrap();
+        let mctx = SessionContext::new();
+        mctx.register_table("t", Arc::new(MemTable::try_new(schema, vec![batches]).unwrap())).unwrap();
+
+        async fn dump(ctx: &SessionContext, sql: &str) -> String {
+            let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            datafusion::arrow::util::pretty::pretty_format_batches(&batches).unwrap().to_string()
+        }
+        for sql in [
+            "SELECT amount, ts FROM t WHERE amount > 100.50 ORDER BY amount",
+            "SELECT amount, ts FROM t WHERE amount = 25.00 ORDER BY amount",
+            "SELECT amount, ts FROM t WHERE ts >= '2024-01-01T00:00:00' ORDER BY ts",
+            "SELECT amount, ts FROM t WHERE ts < '2024-01-01T00:00:00' ORDER BY ts",
+            "SELECT amount, ts FROM t ORDER BY amount",
+        ] {
+            assert_eq!(dump(&kctx, sql).await, dump(&mctx, sql).await, "mismatch for: {sql}");
+        }
     }
 
     #[tokio::test]

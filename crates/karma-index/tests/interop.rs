@@ -34,6 +34,17 @@ fn canonical() -> ZoneMap {
             row_count: 50,
             columns: vec![ColumnStats { field_id: 1, min: Value::I64(20), max: Value::I64(30), null_count: 0, value_count: 50 }],
         },
+        ZoneStats {
+            zone_id: 2,
+            row_offset: 150,
+            row_count: 25,
+            columns: vec![
+                ColumnStats { field_id: 10, min: Value::Decimal { unscaled: -10050, scale: 2 }, max: Value::Decimal { unscaled: 999_999, scale: 2 }, null_count: 0, value_count: 25 },
+                ColumnStats { field_id: 11, min: Value::Date(-1), max: Value::Date(19_723), null_count: 0, value_count: 25 },
+                ColumnStats { field_id: 12, min: Value::Time(0), max: Value::Time(86_399_999_999), null_count: 0, value_count: 25 },
+                ColumnStats { field_id: 13, min: Value::Timestamp(1_672_531_200_000_000), max: Value::Timestamp(1_704_067_200_000_000), null_count: 0, value_count: 25 },
+            ],
+        },
     ])
 }
 
@@ -47,7 +58,7 @@ fn rust_reads_python_written_puffin() {
     let bytes = std::fs::read(&path).expect("read python fixture");
     let pf = read_puffin(&bytes).expect("valid Puffin from Python");
     let meta = pf.first_of_type(ZONEMAP_BLOB_TYPE).expect("karma-zonemap-v1 blob present");
-    assert_eq!(meta.fields, vec![1, 2, 5, 6, 7], "blob fields");
+    assert_eq!(meta.fields, vec![1, 2, 5, 6, 7, 10, 11, 12, 13], "blob fields");
     assert_eq!(meta.snapshot_id, -1);
     let zm = ZoneMap::decode(pf.blob_bytes(meta).unwrap()).expect("decode python-written zone map");
     assert_eq!(zm, canonical(), "Python-written zone map decoded by Rust must equal the canonical");

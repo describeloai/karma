@@ -1,8 +1,8 @@
 {
-  "_comment": "Canonical karma-zonemap-v1 fixture — the shared source of truth for cross-read validation. Rust and an INDEPENDENT Python impl each build a Puffin file from this and read the other's output; the zone-map payload bytes must be byte-identical. Values are tagged: one of i64|f64|str|bool|null.",
+  "_comment": "Canonical karma-zonemap-v1 fixture — the shared source of truth for cross-read validation. Rust and an INDEPENDENT Python impl each build a Puffin file from this and read the other's output; the zone-map payload bytes must be byte-identical. Values are tagged: one of i64|f64|str|bool|null|decimal|date|time|timestamp. decimal = {unscaled,scale} (exact, i128); date = days-since-epoch (i32); time = µs-since-midnight (i64); timestamp = µs-since-epoch (i64).",
   "blob": {
     "type": "karma-zonemap-v1",
-    "fields": [1, 2, 5, 6, 7],
+    "fields": [1, 2, 5, 6, 7, 10, 11, 12, 13],
     "snapshot_id": -1,
     "sequence_number": -1
   },
@@ -25,6 +25,17 @@
       "row_count": 50,
       "columns": [
         { "field_id": 1, "null_count": 0, "value_count": 50, "min": { "i64": 20 }, "max": { "i64": 30 } }
+      ]
+    },
+    {
+      "zone_id": 2,
+      "row_offset": 150,
+      "row_count": 25,
+      "columns": [
+        { "field_id": 10, "null_count": 0, "value_count": 25, "min": { "decimal": { "unscaled": -10050, "scale": 2 } }, "max": { "decimal": { "unscaled": 999999, "scale": 2 } } },
+        { "field_id": 11, "null_count": 0, "value_count": 25, "min": { "date": -1 },                 "max": { "date": 19723 } },
+        { "field_id": 12, "null_count": 0, "value_count": 25, "min": { "time": 0 },                  "max": { "time": 86399999999 } },
+        { "field_id": 13, "null_count": 0, "value_count": 25, "min": { "timestamp": 1672531200000000 }, "max": { "timestamp": 1704067200000000 } }
       ]
     }
   ]

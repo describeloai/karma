@@ -43,8 +43,27 @@ fn cmp(a: &Value, b: &Value) -> Option<Ordering> {
         (Value::I64(x), Value::I64(y)) => Some(x.cmp(y)),
         (Value::F64(x), Value::F64(y)) => x.partial_cmp(y), // NaN → None
         (Value::Bytes(x), Value::Bytes(y)) => Some(x.cmp(y)), // byte order == UTF-8 code-point order
-        _ => None,
+        // A decimal's ordering reduces to its integer `unscaled` ONLY at a common
+        // scale. If the scales differ we refuse to compare (→ `None` → don't skip)
+        // rather than rescale — rescaling can overflow `i128`, and within a column
+        // the scale is fixed anyway, so a mismatch means the bound came from
+        // elsewhere and must be treated conservatively.
+        (Value::Decimal { unscaled: x, scale: sx }, Value::Decimal { unscaled: y, scale: sy }) => {
+            (sx == sy).then(|| x.cmp(y))
+        }
+        (Value::Date(x), Value::Date(y)) => Some(x.cmp(y)),
+        (Value::Time(x), Value::Time(y)) => Some(x.cmp(y)),
+        (Value::Timestamp(x), Value::Timestamp(y)) => Some(x.cmp(y)),
+        _ => None, // different variants (incl. a `Null` bound) → incomparable
     }
+}
+
+/// Ordered comparison of two bounds — **public** so index builders compute a zone's
+/// `min`/`max` with the *exact* ordering the pruner later uses (no drift). `None` =
+/// incomparable (different variants, a `Null` bound, a `NaN` float, or two decimals
+/// of unequal scale); a builder should treat that value as not-updating the bound.
+pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
+    cmp(a, b)
 }
 
 /// Can this zone be skipped for this predicate? Only `true` when *proven*.
@@ -167,6 +186,38 @@ mod tests {
         // zone 1 has no stats for field 2 → it must survive (never skip on ignorance).
         let survivors = surviving_zones(&zm(), &Predicate::Eq(2, Value::str("zzz")));
         assert!(survivors.contains(&1));
+    }
+
+    #[test]
+    fn decimal_bounds_prune_exactly() {
+        // Decimal(10,2). zone 0: 1.00..10.00 (unscaled 100..1000); zone 1: 100.50..999.99.
+        let dec = |u: i128| Value::Decimal { unscaled: u, scale: 2 };
+        let zm = ZoneMap::new(vec![
+            ZoneStats { zone_id: 0, row_offset: 0, row_count: 10, columns: vec![ColumnStats { field_id: 1, min: dec(100), max: dec(1000), null_count: 0, value_count: 10 }] },
+            ZoneStats { zone_id: 1, row_offset: 10, row_count: 10, columns: vec![ColumnStats { field_id: 1, min: dec(10050), max: dec(99999), null_count: 0, value_count: 10 }] },
+        ]);
+        // amount > 100.50 → zone 0 (max 10.00) pruned, zone 1 survives.
+        assert_eq!(surviving_zones(&zm, &Predicate::Gt(1, dec(10050))), vec![1]);
+        // amount = 5.00 (unscaled 500) → only zone 0.
+        assert_eq!(surviving_zones(&zm, &Predicate::Eq(1, dec(500))), vec![0]);
+        // A mismatched scale is incomparable → conservative: NO zone pruned.
+        let other_scale = Value::Decimal { unscaled: 10050, scale: 4 };
+        assert_eq!(surviving_zones(&zm, &Predicate::Gt(1, other_scale)), vec![0, 1]);
+    }
+
+    #[test]
+    fn timestamp_bounds_prune() {
+        // micros since epoch. zone 0: 2023, zone 1: 2024.
+        let ts_2023 = 1_672_531_200_000_000; // 2023-01-01
+        let ts_2024 = 1_704_067_200_000_000; // 2024-01-01
+        let zm = ZoneMap::new(vec![
+            ZoneStats { zone_id: 0, row_offset: 0, row_count: 5, columns: vec![ColumnStats { field_id: 2, min: Value::Timestamp(ts_2023), max: Value::Timestamp(ts_2024 - 1), null_count: 0, value_count: 5 }] },
+            ZoneStats { zone_id: 1, row_offset: 5, row_count: 5, columns: vec![ColumnStats { field_id: 2, min: Value::Timestamp(ts_2024), max: Value::Timestamp(ts_2024 + 1_000_000), null_count: 0, value_count: 5 }] },
+        ]);
+        // ts >= '2024-01-01' → zone 0 pruned.
+        assert_eq!(surviving_zones(&zm, &Predicate::GtEq(2, Value::Timestamp(ts_2024))), vec![1]);
+        // A Date bound is a different variant → incomparable → conservative.
+        assert_eq!(surviving_zones(&zm, &Predicate::GtEq(2, Value::Date(19_723))), vec![0, 1]);
     }
 
     #[test]
