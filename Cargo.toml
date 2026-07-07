@@ -1,0 +1,20 @@
+# Karma — Cargo workspace.
+#
+# Format-first: the founding member is `karma-index`, the OPEN INDEX FORMAT for
+# Apache Iceberg (zone-map / bloom / bitmap / inverted), stored as Puffin blobs.
+# The execution engine (DataFusion-kernelled serving) comes AFTER the format —
+# the format is the donable, multi-stakeholder magnet (ASF thesis, HANDOFF §7).
+[workspace]
+resolver = "2"
+members = ["crates/karma-index"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["The Karma Authors"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
