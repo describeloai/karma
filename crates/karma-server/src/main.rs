@@ -64,7 +64,11 @@ struct ErrorResponse {
 
 #[tokio::main]
 async fn main() {
-    let bind = std::env::var("KARMA_BIND").unwrap_or_else(|_| "0.0.0.0:8088".to_string());
+    // Bind priority: KARMA_BIND (explicit) > PORT (Railway/Render inject it) > default.
+    let bind = std::env::var("KARMA_BIND")
+        .ok()
+        .or_else(|| std::env::var("PORT").ok().map(|p| format!("0.0.0.0:{p}")))
+        .unwrap_or_else(|| "0.0.0.0:8088".to_string());
     let ml_url = std::env::var("ML_RUNNER_URL").expect("ML_RUNNER_URL is required");
     let ml_token = std::env::var("ML_RUNNER_TOKEN").expect("ML_RUNNER_TOKEN is required");
     let store = s3_store(&S3Config::from_env().expect("LAKEHOUSE_S3_* env is required"))
