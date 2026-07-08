@@ -102,12 +102,23 @@ async fn post_sql(
         .await
         .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    let columns = result
+    // Parity with the Postgres path: the reserved identity columns are stamped on
+    // every Iceberg row but hidden from the user (the PG CTE never projects them).
+    const RESERVED: [&str; 3] = ["__row_index", "__row_id", "__created_at"];
+    let columns: Vec<ColumnDto> = result
         .columns
         .iter()
+        .filter(|c| !RESERVED.contains(&c.name.as_str()))
         .map(|c| ColumnDto { name: c.name.clone(), ty: c.data_type.clone() })
         .collect();
-    let rows = batches_to_json(&result.batches).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let mut rows = batches_to_json(&result.batches).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    for row in &mut rows {
+        if let serde_json::Value::Object(map) = row {
+            for k in RESERVED {
+                map.remove(k);
+            }
+        }
+    }
 
     Ok(Json(SqlResponse { columns, rows }))
 }
