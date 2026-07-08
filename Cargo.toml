@@ -6,7 +6,7 @@
 # the format is the donable, multi-stakeholder magnet (ASF thesis, HANDOFF §7).
 [workspace]
 resolver = "2"
-members = ["crates/karma-index", "crates/karma-datafusion", "crates/karma-parquet"]
+members = ["crates/karma-index", "crates/karma-datafusion", "crates/karma-parquet", "crates/karma-sql"]
 
 [workspace.package]
 version = "0.0.0"

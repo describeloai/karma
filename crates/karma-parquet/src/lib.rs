@@ -78,6 +78,9 @@ pub struct ParquetZoneTable {
     zone_map: ZoneMap,
     blooms: Option<ZoneBlooms>,
     field_ids: HashMap<String, i32>,
+    /// Optional sink recording the row groups each `scan` decided to read — lets a
+    /// harness observe that pruning fired (e.g. through a Substrait round-trip).
+    scan_observer: Option<Arc<std::sync::Mutex<Vec<Vec<usize>>>>>,
 }
 
 impl ParquetZoneTable {
@@ -90,7 +93,7 @@ impl ParquetZoneTable {
     ) -> Result<Self, KarmaParquetError> {
         let path = path.into();
         let schema = read::read_schema(File::open(&path)?)?;
-        Ok(Self { path, schema, zone_map, blooms, field_ids })
+        Ok(Self { path, schema, zone_map, blooms, field_ids, scan_observer: None })
     }
 
     /// Construct from a [`Sidecar`] built by [`build_sidecar`]. An empty bloom set is
@@ -103,7 +106,15 @@ impl ParquetZoneTable {
             zone_map: sidecar.zone_map,
             blooms,
             field_ids: sidecar.field_ids,
+            scan_observer: None,
         }
+    }
+
+    /// Attach a sink that records the row groups read by each `scan` (for tests /
+    /// harnesses that want to assert pruning happened).
+    pub fn observe_scans(mut self, sink: Arc<std::sync::Mutex<Vec<Vec<usize>>>>) -> Self {
+        self.scan_observer = Some(sink);
+        self
     }
 
     /// Build the sidecar from the Parquet file and construct the table in one step.
@@ -151,6 +162,9 @@ impl TableProvider for ParquetZoneTable {
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let row_groups = self.surviving_row_groups(filters);
+        if let Some(sink) = &self.scan_observer {
+            sink.lock().unwrap().push(row_groups.clone());
+        }
         // Read ONLY the surviving row groups — the pruned ones' bytes are never fetched.
         let file = File::open(&self.path).map_err(|e| to_df_err(e.into()))?;
         let (_schema, batches) = read::read_row_groups(file, &row_groups).map_err(to_df_err)?;
