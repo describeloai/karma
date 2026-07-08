@@ -46,23 +46,38 @@ struct PlanFilesResponse {
 
 impl MlRunnerClient {
     pub fn new(base: impl Into<String>, token: impl Into<String>) -> Self {
+        // trim(): env values pasted into a deploy UI often carry a trailing newline /
+        // spaces / quotes, which make the URL or the Authorization header invalid
+        // (reqwest "builder error"). Be defensive.
         Self {
-            base: base.into().trim_end_matches('/').to_string(),
-            token: token.into(),
+            base: base.into().trim().trim_matches('"').trim_end_matches('/').to_string(),
+            token: token.into().trim().trim_matches('"').to_string(),
             http: reqwest::Client::new(),
         }
     }
 
     /// Resolve a dataset to its current snapshot's data-file object paths.
     pub async fn plan_files(&self, namespace: &str, dataset_id: &str) -> Result<Vec<String>, String> {
+        let url = format!("{}/lakehouse/plan-files", self.base);
         let resp = self
             .http
-            .post(format!("{}/lakehouse/plan-files", self.base))
+            .post(&url)
             .bearer_auth(&self.token)
             .json(&serde_json::json!({ "namespace": namespace, "dataset_id": dataset_id }))
             .send()
             .await
-            .map_err(|e| format!("plan-files request failed: {e}"))?;
+            .map_err(|e| {
+                // Surface the underlying cause (invalid URL / header) — reqwest's Display
+                // for a builder error is otherwise just "builder error".
+                use std::error::Error;
+                let mut msg = format!("plan-files POST {url} failed: {e}");
+                let mut src = e.source();
+                while let Some(s) = src {
+                    msg.push_str(&format!(" | {s}"));
+                    src = s.source();
+                }
+                msg
+            })?;
         if !resp.status().is_success() {
             let code = resp.status();
             let body = resp.text().await.unwrap_or_default();
