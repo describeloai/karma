@@ -16,13 +16,18 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use std::fs::File;
+use std::sync::Arc;
 
 use datafusion::arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
     Int64Array, LargeStringArray, StringArray, TimestampMicrosecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use datafusion::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use futures::TryStreamExt;
+use object_store::{path::Path as ObjPath, ObjectStore};
 
 use karma_index::{compare, Bloom, BloomEntry, ColumnStats, Value, ZoneBlooms, ZoneMap, ZoneStats, DEFAULT_BITS_PER_VALUE};
 
@@ -78,61 +83,120 @@ pub fn build_sidecar_sized(
     let n_row_groups = meta.num_row_groups();
     drop(head);
 
-    // Resolve each indexed field to a (column index, data type) once.
-    let mut resolved: Vec<(usize, DataType, &IndexField)> = Vec::with_capacity(fields.len());
-    for f in fields {
-        let idx = schema
-            .index_of(&f.name)
-            .map_err(|_| KarmaParquetError::MissingColumn(f.name.clone()))?;
-        resolved.push((idx, schema.field(idx).data_type().clone(), f));
-    }
-
+    let resolved = resolve_fields(&schema, fields)?;
     let mut zones = Vec::with_capacity(n_row_groups);
     let mut bloom_entries = Vec::new();
     let mut row_offset: u64 = 0;
 
     for rg in 0..n_row_groups {
         let row_count = meta.row_group(rg).num_rows() as u64;
-
         // Read just this row group; a row group may arrive as several batches.
-        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?
-            .with_row_groups(vec![rg])
-            .build()?;
-
-        // Accumulate per-field stats across the row group's batches.
+        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?.with_row_groups(vec![rg]).build()?;
         let mut accs: Vec<ColAccum> = resolved.iter().map(|_| ColAccum::default()).collect();
         for batch in reader {
-            let batch = batch?;
-            for (slot, (col_idx, dtype, field)) in accs.iter_mut().zip(resolved.iter()) {
-                let arr = batch.column(*col_idx);
-                fold_column(dtype, arr, field.bloom, slot)?;
-            }
+            fold_batch(&batch?, &resolved, &mut accs)?;
         }
-
-        let mut columns = Vec::with_capacity(resolved.len());
-        for (acc, (_idx, _dtype, field)) in accs.into_iter().zip(resolved.iter()) {
-            columns.push(ColumnStats {
-                field_id: field.field_id,
-                min: acc.min.unwrap_or(Value::Null),
-                max: acc.max.unwrap_or(Value::Null),
-                null_count: acc.null_count,
-                value_count: acc.value_count,
-            });
-            if field.bloom {
-                bloom_entries.push(BloomEntry {
-                    zone_id: rg as u32,
-                    field_id: field.field_id,
-                    bloom: Bloom::build(&acc.bloom_values, bits_per_value),
-                });
-            }
-        }
-
-        zones.push(ZoneStats { zone_id: rg as u32, row_offset, row_count, columns });
+        zones.push(zone_from_accs(&resolved, accs, rg, row_offset, row_count, bits_per_value, &mut bloom_entries));
         row_offset += row_count;
     }
+    Ok(assemble_sidecar(schema, fields, zones, bloom_entries))
+}
 
+/// Build a [`Sidecar`] from a Parquet file **in an object store** (R2/S3). The
+/// object-store counterpart of [`build_sidecar`]: reads one row group at a time over
+/// the network (bounded RAM), fetching only each row group's bytes.
+pub async fn build_sidecar_object(
+    store: Arc<dyn ObjectStore>,
+    path: &ObjPath,
+    fields: &[IndexField],
+) -> Result<Sidecar, KarmaParquetError> {
+    build_sidecar_object_sized(store, path, fields, DEFAULT_BITS_PER_VALUE).await
+}
+
+/// Like [`build_sidecar_object`] but with an explicit bloom bits-per-value.
+pub async fn build_sidecar_object_sized(
+    store: Arc<dyn ObjectStore>,
+    path: &ObjPath,
+    fields: &[IndexField],
+    bits_per_value: usize,
+) -> Result<Sidecar, KarmaParquetError> {
+    let head = ParquetRecordBatchStreamBuilder::new(ParquetObjectReader::new(store.clone(), path.clone())).await?;
+    let schema = head.schema().clone();
+    let meta = head.metadata().clone();
+    let n_row_groups = meta.num_row_groups();
+    drop(head);
+
+    let resolved = resolve_fields(&schema, fields)?;
+    let mut zones = Vec::with_capacity(n_row_groups);
+    let mut bloom_entries = Vec::new();
+    let mut row_offset: u64 = 0;
+
+    for rg in 0..n_row_groups {
+        let row_count = meta.row_group(rg).num_rows() as u64;
+        let stream = ParquetRecordBatchStreamBuilder::new(ParquetObjectReader::new(store.clone(), path.clone()))
+            .await?
+            .with_row_groups(vec![rg])
+            .build()?;
+        let batches = stream.try_collect::<Vec<_>>().await?;
+        let mut accs: Vec<ColAccum> = resolved.iter().map(|_| ColAccum::default()).collect();
+        for batch in &batches {
+            fold_batch(batch, &resolved, &mut accs)?;
+        }
+        zones.push(zone_from_accs(&resolved, accs, rg, row_offset, row_count, bits_per_value, &mut bloom_entries));
+        row_offset += row_count;
+    }
+    Ok(assemble_sidecar(schema, fields, zones, bloom_entries))
+}
+
+type Resolved<'a> = Vec<(usize, DataType, &'a IndexField)>;
+
+/// Resolve each indexed field to its `(column index, data type)` in the schema.
+fn resolve_fields<'a>(schema: &SchemaRef, fields: &'a [IndexField]) -> Result<Resolved<'a>, KarmaParquetError> {
+    let mut resolved = Vec::with_capacity(fields.len());
+    for f in fields {
+        let idx = schema.index_of(&f.name).map_err(|_| KarmaParquetError::MissingColumn(f.name.clone()))?;
+        resolved.push((idx, schema.field(idx).data_type().clone(), f));
+    }
+    Ok(resolved)
+}
+
+/// Fold one record batch into the per-field accumulators.
+fn fold_batch(batch: &RecordBatch, resolved: &Resolved, accs: &mut [ColAccum]) -> Result<(), KarmaParquetError> {
+    for (slot, (col_idx, dtype, field)) in accs.iter_mut().zip(resolved.iter()) {
+        fold_column(dtype, batch.column(*col_idx), field.bloom, slot)?;
+    }
+    Ok(())
+}
+
+/// Turn a row group's finished accumulators into a [`ZoneStats`] (+ push blooms).
+fn zone_from_accs(
+    resolved: &Resolved,
+    accs: Vec<ColAccum>,
+    rg: usize,
+    row_offset: u64,
+    row_count: u64,
+    bits_per_value: usize,
+    bloom_entries: &mut Vec<BloomEntry>,
+) -> ZoneStats {
+    let mut columns = Vec::with_capacity(resolved.len());
+    for (acc, (_idx, _dtype, field)) in accs.into_iter().zip(resolved.iter()) {
+        columns.push(ColumnStats {
+            field_id: field.field_id,
+            min: acc.min.unwrap_or(Value::Null),
+            max: acc.max.unwrap_or(Value::Null),
+            null_count: acc.null_count,
+            value_count: acc.value_count,
+        });
+        if field.bloom {
+            bloom_entries.push(BloomEntry { zone_id: rg as u32, field_id: field.field_id, bloom: Bloom::build(&acc.bloom_values, bits_per_value) });
+        }
+    }
+    ZoneStats { zone_id: rg as u32, row_offset, row_count, columns }
+}
+
+fn assemble_sidecar(schema: SchemaRef, fields: &[IndexField], zones: Vec<ZoneStats>, blooms: Vec<BloomEntry>) -> Sidecar {
     let field_ids = fields.iter().map(|f| (f.name.clone(), f.field_id)).collect();
-    Ok(Sidecar { schema, zone_map: ZoneMap::new(zones), blooms: ZoneBlooms::new(bloom_entries), field_ids })
+    Sidecar { schema, zone_map: ZoneMap::new(zones), blooms: ZoneBlooms::new(blooms), field_ids }
 }
 
 /// Running per-column accumulator over a row group's batches.

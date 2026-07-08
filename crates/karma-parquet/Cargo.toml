@@ -10,6 +10,13 @@ description = "A Parquet-backed karma-index TableProvider — skips row-group I/
 # datafusion re-exports the version-matched `arrow` and `parquet` (incl. the C
 # `zstd-sys`), so we pull neither directly — avoids an arrow/parquet version skew.
 datafusion = "54.0.0"
+# We depend on `parquet` directly ONLY to turn on its async object-store reader; the
+# version is pinned to exactly what datafusion pulls (58.3.0), so cargo unifies to a
+# single instance and `datafusion::parquet` gains these features too. `object_store` is
+# likewise pinned to datafusion's version.
+parquet = { version = "58.3.0", default-features = false, features = ["arrow", "async", "object_store"] }
+object_store = { version = "0.13.2", features = ["aws"] }  # `aws` = the AmazonS3Builder (R2/S3)
+futures = "0.3"
 karma-index = { path = "../karma-index" }
 karma-datafusion = { path = "../karma-datafusion" }
 async-trait = "0.1"

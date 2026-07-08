@@ -74,9 +74,9 @@ needed.
 
 | # | Build | Repo | De-risks / delivers |
 |---|---|---|---|
-| **3→1** | **Substrait spine** (this iteration) — prove `SQL → LogicalPlan → Substrait (bytes) → LogicalPlan → execute` over a **karma-parquet** TableProvider, results identical to direct, **and Karma pruning still fires** | Karma | **The IR decision.** "Do we lose filter pushdown / correctness through Substrait?" — answered before investing in the reader |
-| 1→2 | **Object-store reader** (R2/S3) in `karma-parquet` | Karma | Local `File` → Iceberg Parquet on R2 |
-| 2→3 | **Iceberg resolution** — table → current snapshot → Parquet files via Lakekeeper REST → karma providers | Karma | The catalog binding |
+| **3→1** ✅ | **Substrait spine** — prove `SQL → LogicalPlan → Substrait (bytes) → LogicalPlan → execute` over a **karma-parquet** TableProvider, results identical + Karma pruning survives | Karma | **The IR decision — GO** (`crates/karma-sql`) |
+| **1→2** ✅ | **Object-store reader** (R2/S3) in `karma-parquet` — async `ParquetObjectReader` fetches only surviving row groups over the wire; `build_sidecar_object`; `ParquetZoneTable` over a `Source::{Local,Object}`; `S3Config`/`s3_store` for R2 | Karma | Local `File` → **Iceberg Parquet on R2**. Tested over an in-memory store: differential vs native, pruning over the network, selection honored |
+| 2→3 | **Iceberg resolution** — table → current snapshot → Parquet files via Lakekeeper REST → karma providers | Karma | The catalog binding — **next** |
 | 4 | **Front: SQL → Substrait with our rules** | Karma | "Our vocabulary" |
 | 5 | **Seam swap in Carbon** — route calls the Karma engine at `translateQuery→execute`, gated by the freshness oracle, PG fallback | Carbon | Deletes the shim |
 | 6 | **Shadow rollout + own the dialect** — diff PG↔Karma read-only, flip per-dataset via reader-flags | both | Safe cutover |
