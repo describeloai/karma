@@ -11,10 +11,20 @@
 //! we do not rebuild it. The ownable work is the front (binding + our rules) and this
 //! Substrait boundary — never a new optimizer.
 //!
-//! This crate is currently the **spine spike**: it proves the round-trip preserves
-//! results *and* Karma row-group pruning (filters survive the Substrait contract and
-//! still reach the provider's `scan`). The SQL front (our rules) and the object-store /
-//! Iceberg catalog binding land next — see `docs/proposals/0002-karma-sql-engine.md`.
+//! The **spine** (below) proves the round-trip preserves results *and* Karma row-group
+//! pruning (filters survive the Substrait contract and still reach the provider's
+//! `scan`). On top of it, the **SQL front** ([`KarmaSession`]) binds the user's SQL
+//! against our catalog + rules and returns explicit columns + types — see
+//! [`session`], [`catalog`], [`udf`], and `docs/proposals/0002-karma-sql-engine.md`.
+
+pub mod catalog;
+pub mod session;
+pub mod udf;
+
+pub use catalog::{
+    FixedIndex, IndexStrategy, KarmaCatalogList, NoIndex, SnapshotTableResolver, TableResolver,
+};
+pub use session::{ColumnMeta, KarmaConfig, KarmaSession, QueryResult};
 
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::dataframe::DataFrame;

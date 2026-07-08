@@ -11,9 +11,13 @@ datafusion = "54.0.0"
 datafusion-substrait = "54.0.0"
 substrait = "0.63"
 prost = "0.14"  # MUST match the prost that `substrait` pulls (0.14.x) or Message is a different trait
+async-trait = "0.1"     # for the async SchemaProvider / TableResolver
+serde_json = { workspace = true }  # GET_JSON_OBJECT extraction
 karma-index = { path = "../karma-index" }
 karma-datafusion = { path = "../karma-datafusion" }
 karma-parquet = { path = "../karma-parquet" }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+object_store = { version = "0.13.2", features = ["aws"] }  # InMemory store for the front test
+bytes = "1"
