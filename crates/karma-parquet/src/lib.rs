@@ -34,6 +34,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -48,6 +49,8 @@ pub mod bench;
 pub mod build;
 pub mod object;
 pub mod read;
+#[cfg(feature = "rest-catalog")]
+pub mod rest;
 
 pub use build::{build_sidecar, build_sidecar_sized, IndexField, Sidecar};
 pub use object::{s3_store, S3Config};
@@ -64,6 +67,8 @@ pub enum KarmaParquetError {
     ObjectStore(#[from] object_store::Error),
     #[error("config: {0}")]
     Config(String),
+    #[error("iceberg catalog: {0}")]
+    Iceberg(String),
     #[error("column '{0}' not found in the parquet schema")]
     MissingColumn(String),
     #[error("unsupported column type for indexing: {0}")]
@@ -170,6 +175,29 @@ impl ParquetZoneTable {
             .map(|i| self.zone_map.zones[i].zone_id as usize)
             .collect()
     }
+
+    /// Prune, then read the surviving row groups' batches (from disk or over the wire).
+    /// No projection is applied — the caller / `MemorySource` projects. This is the
+    /// building block shared by the single-file [`scan`](Self::scan) and the multi-file
+    /// [`SnapshotTable`].
+    pub async fn scan_batches(&self, filters: &[Expr]) -> DFResult<Vec<RecordBatch>> {
+        let row_groups = self.surviving_row_groups(filters);
+        if let Some(sink) = &self.scan_observer {
+            sink.lock().unwrap().push(row_groups.clone());
+        }
+        // Read ONLY the surviving row groups — the pruned ones' bytes are never fetched
+        // (from disk for a local file, or over the network for an object-store file).
+        let (_schema, batches) = match &self.source {
+            Source::Local(path) => {
+                let file = File::open(path).map_err(|e| to_df_err(e.into()))?;
+                read::read_row_groups(file, &row_groups).map_err(to_df_err)?
+            }
+            Source::Object { store, path } => {
+                read::read_row_groups_object(store.clone(), path, &row_groups).await.map_err(to_df_err)?
+            }
+        };
+        Ok(batches)
+    }
 }
 
 #[async_trait]
@@ -193,23 +221,97 @@ impl TableProvider for ParquetZoneTable {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let row_groups = self.surviving_row_groups(filters);
-        if let Some(sink) = &self.scan_observer {
-            sink.lock().unwrap().push(row_groups.clone());
-        }
-        // Read ONLY the surviving row groups — the pruned ones' bytes are never fetched
-        // (from disk for a local file, or over the network for an object-store file).
-        let (_schema, batches) = match &self.source {
-            Source::Local(path) => {
-                let file = File::open(path).map_err(|e| to_df_err(e.into()))?;
-                read::read_row_groups(file, &row_groups).map_err(to_df_err)?
-            }
-            Source::Object { store, path } => {
-                read::read_row_groups_object(store.clone(), path, &row_groups).await.map_err(to_df_err)?
-            }
-        };
+        let batches = self.scan_batches(filters).await?;
         // One partition holding the surviving row groups' batches, in row-group order.
         let exec = MemorySourceConfig::try_new_exec(&[batches], self.schema.clone(), projection.cloned())?;
+        Ok(exec)
+    }
+}
+
+/// The object-store data files that make up one Iceberg **snapshot**, resolved from a
+/// catalog. `store` serves them all; `files` are the object keys of the Parquet data
+/// files of the table's current snapshot.
+#[derive(Clone, Debug)]
+pub struct ResolvedSnapshot {
+    pub store: Arc<dyn ObjectStore>,
+    pub files: Vec<ObjPath>,
+}
+
+/// Resolve a logical table name to its current snapshot's data files. The seam between
+/// the catalog (Lakekeeper / Iceberg REST) and the reader — implemented by
+/// `RestResolver` (feature `rest-catalog`), and trivially in tests.
+#[async_trait]
+pub trait SnapshotResolver: Send + Sync {
+    async fn resolve(&self, table: &str) -> Result<ResolvedSnapshot, KarmaParquetError>;
+}
+
+/// A DataFusion table over an Iceberg **snapshot** — the many Parquet data files that
+/// make up one table version, each pruned by its own Karma sidecar, presented as one
+/// logical table. (An Iceberg table read is a union of its data files; Karma prunes
+/// row groups *within* each, and whole files whose bounds cannot match.)
+#[derive(Debug)]
+pub struct SnapshotTable {
+    schema: SchemaRef,
+    files: Vec<ParquetZoneTable>,
+}
+
+impl SnapshotTable {
+    /// All `files` must share the snapshot's table `schema`.
+    pub fn new(schema: SchemaRef, files: Vec<ParquetZoneTable>) -> Self {
+        Self { schema, files }
+    }
+
+    /// Build a table over a resolved snapshot: index each data file (sidecar built over
+    /// the object store) and union them. `index_fields` chooses which columns to index.
+    pub async fn from_resolved(resolved: ResolvedSnapshot, index_fields: &[IndexField]) -> Result<Self, KarmaParquetError> {
+        let mut files = Vec::with_capacity(resolved.files.len());
+        let mut schema: Option<SchemaRef> = None;
+        for path in resolved.files {
+            let t = ParquetZoneTable::from_parquet_object(resolved.store.clone(), path, index_fields).await?;
+            schema.get_or_insert_with(|| TableProvider::schema(&t));
+            files.push(t);
+        }
+        let schema = schema.ok_or_else(|| KarmaParquetError::Config("snapshot has no data files".into()))?;
+        Ok(Self::new(schema, files))
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+}
+
+#[async_trait]
+impl TableProvider for SnapshotTable {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> DFResult<Vec<TableProviderFilterPushDown>> {
+        // Every file shares the table's field ids, so any file's verdict is the table's.
+        match self.files.first() {
+            Some(f) => f.supports_filters_pushdown(filters),
+            None => Ok(filters.iter().map(|_| TableProviderFilterPushDown::Unsupported).collect()),
+        }
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Prune + read each data file independently (whole files whose bounds can't
+        // match contribute nothing), then union the surviving batches.
+        let mut all = Vec::new();
+        for f in &self.files {
+            all.extend(f.scan_batches(filters).await?);
+        }
+        let exec = MemorySourceConfig::try_new_exec(&[all], self.schema.clone(), projection.cloned())?;
         Ok(exec)
     }
 }

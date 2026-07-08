@@ -21,6 +21,15 @@ karma-index = { path = "../karma-index" }
 karma-datafusion = { path = "../karma-datafusion" }
 async-trait = "0.1"
 thiserror = { workspace = true }
+# The Iceberg REST catalog client (Lakekeeper) — OPTIONAL: only the `rest-catalog`
+# feature pulls it, so the default build stays lean. We use it purely to resolve a
+# table to its data-file paths; the reading is karma-parquet's.
+iceberg = { version = "0.9", optional = true }
+iceberg-catalog-rest = { version = "0.9", optional = true }
+
+[features]
+# Resolve tables via an Iceberg REST catalog (Lakekeeper). Off by default.
+rest-catalog = ["dep:iceberg", "dep:iceberg-catalog-rest"]
 
 [dev-dependencies]
 # `bytes` is only used by the instrumented ChunkReader in the read-path test.

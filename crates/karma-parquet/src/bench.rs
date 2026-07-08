@@ -91,6 +91,13 @@ fn mix(i: u64) -> u64 {
 /// `row_group_size`, written one group at a time (bounded RAM). Deterministic — the
 /// same (rows, row_group_size) always produce byte-identical data.
 pub fn generate_parquet(path: &Path, rows: u64, row_group_size: u64) -> Result<(), KarmaParquetError> {
+    generate_parquet_range(path, 0, rows, row_group_size)
+}
+
+/// Like [`generate_parquet`] but the row indices span `[first_row, first_row + rows)`.
+/// Distinct `first_row`s make disjoint id/ts ranges — a stand-in for the several data
+/// files of one Iceberg snapshot (so a range predicate can prune whole *files*).
+pub fn generate_parquet_range(path: &Path, first_row: u64, rows: u64, row_group_size: u64) -> Result<(), KarmaParquetError> {
     let schema = schema();
     let props = {
         // `set_max_row_group_size` is deprecated for `_row_count`, which isn't in this
@@ -103,16 +110,17 @@ pub fn generate_parquet(path: &Path, rows: u64, row_group_size: u64) -> Result<(
     };
     let mut writer = ArrowWriter::try_new(File::create(path)?, schema.clone(), Some(props))?;
 
-    let mut start: u64 = 0;
-    while start < rows {
-        let n = row_group_size.min(rows - start);
+    let mut done: u64 = 0;
+    while done < rows {
+        let n = row_group_size.min(rows - done);
+        let base = first_row + done;
         let mut ids = Vec::with_capacity(n as usize);
         let mut ts = Vec::with_capacity(n as usize);
         let mut user_ids = Vec::with_capacity(n as usize);
         let mut event_ids: Vec<String> = Vec::with_capacity(n as usize);
         let mut amounts = Vec::with_capacity(n as usize);
         let mut regions: Vec<&str> = Vec::with_capacity(n as usize);
-        for r in start..start + n {
+        for r in base..base + n {
             let h = mix(r);
             ids.push(r as i64); // monotonic → clustered
             ts.push(TS_BASE + (r as i64) * TS_STEP); // monotonic → clustered
@@ -136,7 +144,7 @@ pub fn generate_parquet(path: &Path, rows: u64, row_group_size: u64) -> Result<(
             ],
         )?;
         writer.write(&batch)?;
-        start += n;
+        done += n;
     }
     writer.close()?;
     Ok(())

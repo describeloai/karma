@@ -76,8 +76,8 @@ needed.
 |---|---|---|---|
 | **3→1** ✅ | **Substrait spine** — prove `SQL → LogicalPlan → Substrait (bytes) → LogicalPlan → execute` over a **karma-parquet** TableProvider, results identical + Karma pruning survives | Karma | **The IR decision — GO** (`crates/karma-sql`) |
 | **1→2** ✅ | **Object-store reader** (R2/S3) in `karma-parquet` — async `ParquetObjectReader` fetches only surviving row groups over the wire; `build_sidecar_object`; `ParquetZoneTable` over a `Source::{Local,Object}`; `S3Config`/`s3_store` for R2 | Karma | Local `File` → **Iceberg Parquet on R2**. Tested over an in-memory store: differential vs native, pruning over the network, selection honored |
-| 2→3 | **Iceberg resolution** — table → current snapshot → Parquet files via Lakekeeper REST → karma providers | Karma | The catalog binding — **next** |
-| 4 | **Front: SQL → Substrait with our rules** | Karma | "Our vocabulary" |
+| **2→3** ✅ | **Iceberg resolution** — `SnapshotTable` reads an Iceberg snapshot's many data files as one table (per-file zone-map/bloom pruning, whole files skipped when bounds miss); `RestResolver` (feature `rest-catalog`) consumes Lakekeeper via iceberg-rust — `load_table → scan → plan_files` gives the data-file paths, karma reads them | Karma | The catalog binding. iceberg-rust does *all* the Iceberg mechanics; only file paths cross the boundary. `SnapshotTable` tested over an in-memory store (union + cross-file pruning); `RestResolver` validates against a live Lakekeeper |
+| 4 | **Front: SQL → Substrait with our rules** | Karma | "Our vocabulary" — **next** |
 | 5 | **Seam swap in Carbon** — route calls the Karma engine at `translateQuery→execute`, gated by the freshness oracle, PG fallback | Carbon | Deletes the shim |
 | 6 | **Shadow rollout + own the dialect** — diff PG↔Karma read-only, flip per-dataset via reader-flags | both | Safe cutover |
 
