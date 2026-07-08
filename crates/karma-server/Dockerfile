@@ -7,8 +7,10 @@
 # ── build ──────────────────────────────────────────────────────────────────
 FROM rust:1-bookworm AS builder
 WORKDIR /app
-# protoc is required by karma-sql (datafusion-substrait build.rs).
-RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler && rm -rf /var/lib/apt/lists/*
+# protoc is required by karma-sql (datafusion-substrait build.rs). `libprotobuf-dev`
+# ships the well-known includes (google/protobuf/*.proto) that substrait's .proto files
+# import — `protobuf-compiler` alone does NOT provide them on Debian bookworm.
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN cargo build --release -p karma-server
 
